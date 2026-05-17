@@ -801,7 +801,8 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
-          IMAGE_REFS: masterking32/masterdnsvpn:${{ needs.preflight.outputs.release_tag }},masterking32/masterdnsvpn:latest
+          RELEASE_REPO: ${{ github.repository }}
+          IMAGE_REFS: ${{ github.repository_owner }}/masterdnsvpn:${{ needs.preflight.outputs.release_tag }},${{ github.repository_owner }}/masterdnsvpn:latest
           PLATFORMS: ${{ env.PLATFORMS }}
         run: |
           chmod +x docker/buildx-multi-platform.sh
