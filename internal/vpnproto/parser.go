@@ -282,6 +282,9 @@ func buildPacketFlags() [256]uint8 {
 		Enums.PACKET_DNS_QUERY_RES,
 		Enums.PACKET_DNS_QUERY_REQ_ACK,
 		Enums.PACKET_DNS_QUERY_RES_ACK,
+		Enums.PACKET_RESOLVER_REPORT,
+		Enums.PACKET_RESOLVER_LIST_REQUEST,
+		Enums.PACKET_RESOLVER_LIST_RESPONSE,
 	}
 
 	for _, packetType := range streamAndSeq {
