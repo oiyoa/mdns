@@ -49,6 +49,7 @@ type ClientConfig struct {
 	SetupPacketDuplicationCount           int               `toml:"SETUP_PACKET_DUPLICATION_COUNT"`
 	StreamResolverFailoverResendThreshold int               `toml:"STREAM_RESOLVER_FAILOVER_RESEND_THRESHOLD"`
 	StreamResolverFailoverCooldownSec     float64           `toml:"STREAM_RESOLVER_FAILOVER_COOLDOWN"`
+	ResolverReportEnabled                 bool              `toml:"RESOLVER_REPORT_ENABLED"`
 	RecheckInactiveServersEnabled         bool              `toml:"RECHECK_INACTIVE_SERVERS_ENABLED"`
 	AutoDisableTimeoutServers             bool              `toml:"AUTO_DISABLE_TIMEOUT_SERVERS"`
 	AutoDisableTimeoutWindowSeconds       float64           `toml:"AUTO_DISABLE_TIMEOUT_WINDOW_SECONDS"`
@@ -151,6 +152,7 @@ func defaultClientConfig() ClientConfig {
 		SetupPacketDuplicationCount:           2,
 		StreamResolverFailoverResendThreshold: 2,
 		StreamResolverFailoverCooldownSec:     2.5,
+		ResolverReportEnabled:                 true,
 		RecheckInactiveServersEnabled:         true,
 		AutoDisableTimeoutServers:             true,
 		AutoDisableTimeoutWindowSeconds:       30.0,

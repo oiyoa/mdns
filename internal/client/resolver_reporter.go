@@ -115,6 +115,10 @@ func (r *resolverReporter) maybeSend() {
 	if r == nil || r.client == nil || !r.client.SessionReady() {
 		return
 	}
+	// Honor the per-client opt-out
+	if !r.client.cfg.ResolverReportEnabled {
+		return
+	}
 
 	connections := r.client.balancer.ActiveConnections()
 	current := r.buildEntries(connections)
