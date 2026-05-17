@@ -8,6 +8,7 @@
 package udpserver
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/netip"
 	"os"
@@ -330,31 +331,36 @@ func TestLeaderboardMaybeSaveThrottlesByInterval(t *testing.T) {
 	lb.ConfigurePersistence(path, nil)
 
 	t0 := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
-	ip := mustAddr(t, "1.1.1.1")
+	ip1 := mustAddr(t, "1.1.1.1")
+	ip2 := mustAddr(t, "8.8.8.8")
 
-	recordOne(lb, t0, []netip.Addr{ip})
+	recordOne(lb, t0, []netip.Addr{ip1})
 	lb.MaybeSaveSnapshot(t0)
-	stat1, err := os.Stat(path)
+	content1, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("first save did not happen: %v", err)
 	}
 
-	recordOne(lb, t0.Add(time.Minute), []netip.Addr{ip})
+	// Add a new IP and try to save again within the interval. The throttle
+	// should skip the write so file content stays the same. Asserting on
+	// file contents (not mtime) sidesteps filesystem mtime-granularity flakes.
+	recordOne(lb, t0.Add(time.Minute), []netip.Addr{ip2})
 	lb.MaybeSaveSnapshot(t0.Add(time.Minute))
-	stat2, err := os.Stat(path)
+	content2, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("stat: %v", err)
+		t.Fatalf("read after throttled save: %v", err)
 	}
-	if !stat2.ModTime().Equal(stat1.ModTime()) {
+	if !bytes.Equal(content1, content2) {
 		t.Fatal("second save should have been throttled out within the interval")
 	}
 
+	// After the interval, save proceeds and the second IP appears on disk.
 	lb.MaybeSaveSnapshot(t0.Add(resolverLeaderboardSaveInterval + time.Second))
-	stat3, err := os.Stat(path)
+	content3, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("stat: %v", err)
+		t.Fatalf("read after post-interval save: %v", err)
 	}
-	if stat3.ModTime().Equal(stat1.ModTime()) {
+	if bytes.Equal(content3, content1) {
 		t.Fatal("save after interval should have updated the file")
 	}
 }
