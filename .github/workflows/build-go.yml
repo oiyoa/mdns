@@ -695,15 +695,18 @@ jobs:
             const prSet = new Map();
             const contributors = new Map();
 
+            // Render usernames as profile links (no `@` prefix) so they do not
+            // trigger GitHub mention notifications. This fork builds frequent
+            // releases and we don't want to ping upstream contributors each time.
             for (const c of commits) {
               const sha = c.sha;
-              const author = (c.author && c.author.login) ? `@${c.author.login}` : (c.commit && c.commit.author && c.commit.author.name) || 'unknown';
+              const author = (c.author && c.author.login) ? `[${c.author.login}](https://github.com/${c.author.login})` : (c.commit && c.commit.author && c.commit.author.name) || 'unknown';
               contributors.set(author, (contributors.get(author) || 0) + 1);
               try {
                 const prs = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
                 for (const pr of prs.data) {
                   if (pr.merged_at) {
-                    prSet.set(pr.number, { number: pr.number, title: pr.title, url: pr.html_url, user: pr.user ? `@${pr.user.login}` : '' });
+                    prSet.set(pr.number, { number: pr.number, title: pr.title, url: pr.html_url, user: pr.user ? `[${pr.user.login}](https://github.com/${pr.user.login})` : '' });
                   }
                 }
               } catch (e) {}
