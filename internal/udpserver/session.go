@@ -13,6 +13,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/netip"
 	"slices"
 	"strings"
 	"sync"
@@ -48,6 +49,8 @@ type sessionRecord struct {
 	DownloadMTUBytes                    int
 	VerifyCode                          [4]byte
 	Signature                           [sessionInitDataSize]byte
+	resolverSet                         map[netip.Addr]struct{}
+	resolverSetMu                       sync.Mutex
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
 	CreatedAt                           time.Time
@@ -610,6 +613,45 @@ func clampMTU(value uint16) uint16 {
 
 func isValidSessionResponseMode(value uint8) bool {
 	return value <= mtuProbeModeBase64
+}
+
+const resolverSetMaxEntries = 64
+
+func (r *sessionRecord) noteResolver(ip netip.Addr) {
+	if r == nil || !ip.IsValid() {
+		return
+	}
+	r.resolverSetMu.Lock()
+	defer r.resolverSetMu.Unlock()
+	if _, exists := r.resolverSet[ip]; exists {
+		return
+	}
+	if r.resolverSet == nil {
+		r.resolverSet = make(map[netip.Addr]struct{}, 2)
+	}
+	if len(r.resolverSet) >= resolverSetMaxEntries {
+		return
+	}
+	r.resolverSet[ip] = struct{}{}
+}
+
+func (r *sessionRecord) resolverList() []netip.Addr {
+	if r == nil {
+		return nil
+	}
+	r.resolverSetMu.Lock()
+	defer r.resolverSetMu.Unlock()
+	if len(r.resolverSet) == 0 {
+		return nil
+	}
+	list := make([]netip.Addr, 0, len(r.resolverSet))
+	for ip := range r.resolverSet {
+		list = append(list, ip)
+	}
+	slices.SortFunc(list, func(a, b netip.Addr) int {
+		return a.Compare(b)
+	})
+	return list
 }
 
 func (r *sessionRecord) setLastActivity(now time.Time) {

@@ -196,6 +196,12 @@ DATA_ENCRYPTION_METHOD = 1
 # Relative or absolute path to the encryption key file.
 ENCRYPTION_KEY_FILE = "encrypt_key.txt"
 
+# Relative or absolute path to the resolver stats snapshot file.
+# The server periodically writes a 7-day rolling leaderboard of DNS resolver
+# IPs (counted per closed session) to this file and reloads it on startup so
+# the leaderboard survives restarts. Empty string disables persistence.
+RESOLVER_STATS_FILE = "resolver_stats.json"
+
 # ------------------------------------------------------------------------------
 # 8) ARQ, Packing, and Setup-Control TTLs
 # What this section does:

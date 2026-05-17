@@ -70,6 +70,7 @@ type ServerConfig struct {
 	SupportedDownloadCompressionTypes []int    `toml:"SUPPORTED_DOWNLOAD_COMPRESSION_TYPES"`
 	DataEncryptionMethod              int      `toml:"DATA_ENCRYPTION_METHOD"`
 	EncryptionKeyFile                 string   `toml:"ENCRYPTION_KEY_FILE"`
+	ResolverStatsFile                 string   `toml:"RESOLVER_STATS_FILE"`
 	LogLevel                          string   `toml:"LOG_LEVEL"`
 	ARQWindowSize                     int      `toml:"ARQ_WINDOW_SIZE"`
 	ARQInitialRTOSeconds              float64  `toml:"ARQ_INITIAL_RTO_SECONDS"`
@@ -157,6 +158,7 @@ func defaultServerConfig() ServerConfig {
 		SupportedDownloadCompressionTypes: []int{0, 1, 2, 3},
 		DataEncryptionMethod:              1,
 		EncryptionKeyFile:                 "encrypt_key.txt",
+		ResolverStatsFile:                 "resolver_stats.json",
 		LogLevel:                          "INFO",
 		ARQWindowSize:                     800,
 		ARQInitialRTOSeconds:              1.0,
@@ -633,6 +635,16 @@ func (c ServerConfig) EncryptionKeyPath() string {
 		return c.EncryptionKeyFile
 	}
 	return filepath.Join(c.ConfigDir, c.EncryptionKeyFile)
+}
+
+func (c ServerConfig) ResolverStatsPath() string {
+	if c.ResolverStatsFile == "" {
+		return ""
+	}
+	if filepath.IsAbs(c.ResolverStatsFile) {
+		return c.ResolverStatsFile
+	}
+	return filepath.Join(c.ConfigDir, c.ResolverStatsFile)
 }
 
 func normalizeCompressionTypeList(values []int) []int {

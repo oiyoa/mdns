@@ -132,8 +132,11 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			s.resolverLeaderboard.FlushSnapshot(time.Now())
 			return
 		case now := <-ticker.C:
+			s.resolverLeaderboard.MaybeEmit(now, s.log)
+			s.resolverLeaderboard.MaybeSaveSnapshot(now)
 			expired := s.sessions.Cleanup(now, sessionTimeout, closedRetention)
 			idleDeferred := s.sessions.CollectIdleDeferredSessions(now, s.deferredIdleCleanupTimeout(interval, sessionTimeout))
 			s.sessions.SweepTerminalStreams(now, s.cfg.TerminalStreamRetention())
@@ -217,7 +220,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 				return
 			}
 
-			response := s.safeHandlePacket(req.buf[:req.size])
+			response := s.safeHandlePacket(req.buf[:req.size], req.addr)
 			if len(response) != 0 {
 				writeConn := conn
 				if req.conn != nil {
@@ -238,7 +241,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 	}
 }
 
-func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
+func (s *Server) safeHandlePacket(packet []byte, addr *net.UDPAddr) (response []byte) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if s.log != nil {
@@ -251,7 +254,7 @@ func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
 		}
 	}()
 
-	return s.handlePacket(packet)
+	return s.handlePacket(packet, addr)
 }
 
 func (s *Server) onDrop(addr *net.UDPAddr, queueLen int, queueCap int) {
