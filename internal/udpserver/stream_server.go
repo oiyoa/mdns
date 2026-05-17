@@ -40,6 +40,8 @@ type Stream_server struct {
 	Connected    bool
 	onClosed     func(uint16, time.Time, string)
 	log          arq.Logger
+
+	txClosed bool
 }
 
 func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, localConn io.ReadWriteCloser, mtu int, queueInitialCapacity int, logger arq.Logger) *Stream_server {
@@ -98,6 +100,12 @@ func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum
 	pkt.TTL = ttl
 
 	s.txQueueMu.Lock()
+
+	if s.txClosed {
+		s.txQueueMu.Unlock()
+		putTXPacketToPool(pkt)
+		return false
+	}
 
 	switch packetType {
 	case Enums.PACKET_STREAM_DATA:
@@ -193,6 +201,7 @@ func (s *Stream_server) ClearTXQueue() {
 	}
 
 	s.txQueueMu.Lock()
+	s.txClosed = true
 	s.TXQueue.Clear(func(pkt *serverStreamTXPacket) {
 		putTXPacketToPool(pkt)
 	})
