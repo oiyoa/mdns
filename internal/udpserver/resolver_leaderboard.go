@@ -30,11 +30,28 @@ const (
 	resolverLeaderboardSaveInterval = 10 * time.Minute
 	resolverLeaderboardSchema       = 1
 	resolverLeaderboardDayLayout    = "2006-01-02"
+
+	resolverLeaderboardMinSessionDuration = 30 * time.Second
+	resolverLeaderboardMinPacketsRX       = 20
+
+	resolverDefaultPort = 53
+
+	resolverScoreDurationCap = 30 * time.Minute
+	resolverScoreMTUCap      = 2000.0
+	resolverScoreWeightPop   = 0.5
+	resolverScoreWeightDur   = 0.25
+	resolverScoreWeightMTU   = 0.25
 )
 
+type resolverDailyEntry struct {
+	Sessions       uint64
+	DurationSumNS  uint64
+	DownloadMTUSum uint64
+}
+
 type resolverDailyBucket struct {
-	day    time.Time
-	counts map[netip.Addr]uint64
+	day     time.Time
+	entries map[netip.AddrPort]*resolverDailyEntry
 }
 
 type resolverLeaderboard struct {
@@ -53,9 +70,6 @@ func newResolverLeaderboard() *resolverLeaderboard {
 	}
 }
 
-// ConfigurePersistence sets the snapshot file path and a logger used to report
-// save/load errors. snapshotPath="" disables persistence. Safe to call once
-// during server construction.
 func (l *resolverLeaderboard) ConfigurePersistence(snapshotPath string, log *logger.Logger) {
 	if l == nil {
 		return
@@ -66,8 +80,6 @@ func (l *resolverLeaderboard) ConfigurePersistence(snapshotPath string, log *log
 	l.log = log
 }
 
-// buildResolverLeaderboard wires persistence from the server config and
-// restores any prior snapshot. The returned leaderboard is ready to use.
 func buildResolverLeaderboard(cfg config.ServerConfig, log *logger.Logger) *resolverLeaderboard {
 	lb := newResolverLeaderboard()
 	lb.ConfigurePersistence(cfg.ResolverStatsPath(), log)
@@ -75,31 +87,43 @@ func buildResolverLeaderboard(cfg config.ServerConfig, log *logger.Logger) *reso
 	return lb
 }
 
-// RecordSession increments the count for each distinct resolver IP observed in a
-// closed session. Safe to call from any goroutine. A nil receiver is a no-op.
-func (l *resolverLeaderboard) RecordSession(now time.Time, resolvers []netip.Addr) {
+// RecordSession folds one closed session's contribution into the current
+// daily bucket. The caller is responsible for the real-session threshold.
+func (l *resolverLeaderboard) RecordSession(now time.Time, resolvers []netip.Addr, duration time.Duration, downloadMTU uint16) {
 	if l == nil || len(resolvers) == 0 {
 		return
 	}
 	day := truncToUTCDay(now)
+	durationNS := uint64(0)
+	if duration > 0 {
+		durationNS = uint64(duration.Nanoseconds())
+	}
+	mtu := uint64(downloadMTU)
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	bucket := l.ensureCurrentBucketLocked(day)
 	for _, ip := range resolvers {
-		if !ip.IsValid() {
+		if !isPubliclyRoutableIP(ip) {
 			continue
 		}
-		if _, exists := bucket.counts[ip]; !exists && len(bucket.counts) >= resolverLeaderboardBucketCap {
-			continue
+		key := netip.AddrPortFrom(ip.Unmap(), resolverDefaultPort)
+		entry, exists := bucket.entries[key]
+		if !exists {
+			if len(bucket.entries) >= resolverLeaderboardBucketCap {
+				continue
+			}
+			entry = &resolverDailyEntry{}
+			bucket.entries[key] = entry
 		}
-		bucket.counts[ip]++
+		entry.Sessions++
+		entry.DurationSumNS += durationNS
+		entry.DownloadMTUSum += mtu
 		l.dirtySinceSave = true
 	}
 }
 
-// MaybeEmit logs the top-N resolvers across the 7-day window, but at most once
-// per UTC hour. Returns true if an entry was emitted, false otherwise.
 func (l *resolverLeaderboard) MaybeEmit(now time.Time, log *logger.Logger) bool {
 	if l == nil || log == nil {
 		return false
@@ -121,7 +145,7 @@ func (l *resolverLeaderboard) MaybeEmit(now time.Time, log *logger.Logger) bool 
 
 	parts := make([]string, 0, len(top))
 	for _, entry := range top {
-		parts = append(parts, fmt.Sprintf("<cyan>%s</cyan>: <magenta>%d</magenta>", entry.ip, entry.count))
+		parts = append(parts, fmt.Sprintf("<cyan>%s</cyan>: <magenta>%d</magenta> sess (score=<magenta>%d</magenta>)", entry.AddrPort, entry.Sessions, entry.Score))
 	}
 	log.Infof(
 		"\U0001F4CA <green>Top Resolvers (7d, %d unique)</green> | %s",
@@ -132,8 +156,24 @@ func (l *resolverLeaderboard) MaybeEmit(now time.Time, log *logger.Logger) bool 
 }
 
 type resolverLeaderboardEntry struct {
-	ip    netip.Addr
-	count uint64
+	AddrPort       netip.AddrPort
+	Sessions       uint64
+	AvgDuration    time.Duration
+	AvgDownloadMTU uint16
+	Score          uint16
+}
+
+// TopForDistribution returns up to n best-ranked (IP,port) entries across the
+// whole window, with composite scores. Used to build the response to the
+// client's resolver-list request.
+func (l *resolverLeaderboard) TopForDistribution(n int) []resolverLeaderboardEntry {
+	if l == nil {
+		return nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	top, _ := l.snapshotTopLocked(n)
+	return top
 }
 
 func (l *resolverLeaderboard) ensureCurrentBucketLocked(day time.Time) *resolverDailyBucket {
@@ -143,10 +183,9 @@ func (l *resolverLeaderboard) ensureCurrentBucketLocked(day time.Time) *resolver
 			return last
 		}
 	}
-
 	fresh := &resolverDailyBucket{
-		day:    day,
-		counts: make(map[netip.Addr]uint64, 64),
+		day:     day,
+		entries: make(map[netip.AddrPort]*resolverDailyEntry, 64),
 	}
 	l.buckets = append(l.buckets, fresh)
 	l.pruneBucketsLocked(day)
@@ -173,33 +212,98 @@ func (l *resolverLeaderboard) snapshotTopLocked(n int) ([]resolverLeaderboardEnt
 		return nil, 0
 	}
 
-	totals := make(map[netip.Addr]uint64, 128)
+	type agg struct {
+		sessions       uint64
+		durationSumNS  uint64
+		downloadMTUSum uint64
+	}
+	totals := make(map[netip.AddrPort]*agg, 128)
 	for _, bucket := range l.buckets {
-		for ip, c := range bucket.counts {
-			totals[ip] += c
+		for k, e := range bucket.entries {
+			a := totals[k]
+			if a == nil {
+				a = &agg{}
+				totals[k] = a
+			}
+			a.sessions += e.Sessions
+			a.durationSumNS += e.DurationSumNS
+			a.downloadMTUSum += e.DownloadMTUSum
 		}
 	}
 	if len(totals) == 0 {
 		return nil, 0
 	}
 
+	var maxSessions uint64
+	for _, a := range totals {
+		if a.sessions > maxSessions {
+			maxSessions = a.sessions
+		}
+	}
+
 	entries := make([]resolverLeaderboardEntry, 0, len(totals))
-	for ip, c := range totals {
-		entries = append(entries, resolverLeaderboardEntry{ip: ip, count: c})
+	for k, a := range totals {
+		avgDuration := time.Duration(0)
+		avgMTU := uint16(0)
+		if a.sessions > 0 {
+			avgDuration = time.Duration(a.durationSumNS / a.sessions)
+			avgMTU = uint16(a.downloadMTUSum / a.sessions)
+		}
+		entries = append(entries, resolverLeaderboardEntry{
+			AddrPort:       k,
+			Sessions:       a.sessions,
+			AvgDuration:    avgDuration,
+			AvgDownloadMTU: avgMTU,
+			Score:          composeRankScore(a.sessions, maxSessions, avgDuration, avgMTU),
+		})
 	}
 	slices.SortFunc(entries, func(a, b resolverLeaderboardEntry) int {
-		if a.count != b.count {
-			if a.count > b.count {
+		if a.Score != b.Score {
+			if a.Score > b.Score {
 				return -1
 			}
 			return 1
 		}
-		return a.ip.Compare(b.ip)
+		if a.Sessions != b.Sessions {
+			if a.Sessions > b.Sessions {
+				return -1
+			}
+			return 1
+		}
+		return a.AddrPort.Compare(b.AddrPort)
 	})
 	if n > 0 && n < len(entries) {
 		entries = entries[:n]
 	}
 	return entries, len(totals)
+}
+
+// composeRankScore maps (popularity, avg duration, avg MTU) into a [0..65535]
+// rank. Caller-opaque; clients sort descending. Tweaking weights or caps
+// changes the leaderboard without touching the wire format.
+func composeRankScore(sessions, maxSessions uint64, avgDuration time.Duration, avgMTU uint16) uint16 {
+	popularity := 0.0
+	if maxSessions > 0 {
+		popularity = float64(sessions) / float64(maxSessions)
+	}
+	durationNorm := float64(avgDuration) / float64(resolverScoreDurationCap)
+	if durationNorm > 1 {
+		durationNorm = 1
+	}
+	mtuNorm := float64(avgMTU) / resolverScoreMTUCap
+	if mtuNorm > 1 {
+		mtuNorm = 1
+	}
+	score := resolverScoreWeightPop*popularity +
+		resolverScoreWeightDur*durationNorm +
+		resolverScoreWeightMTU*mtuNorm
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	return uint16(score * 65535)
 }
 
 func truncToUTCDay(t time.Time) time.Time {
@@ -208,19 +312,21 @@ func truncToUTCDay(t time.Time) time.Time {
 }
 
 type leaderboardSnapshotFile struct {
-	Version int                          `json:"version"`
-	Buckets []leaderboardSnapshotBucket  `json:"buckets"`
+	Version int                         `json:"version"`
+	Buckets []leaderboardSnapshotBucket `json:"buckets"`
 }
 
 type leaderboardSnapshotBucket struct {
-	Day    string            `json:"day"`
-	Counts map[string]uint64 `json:"counts"`
+	Day     string                                `json:"day"`
+	Entries map[string]leaderboardSnapshotMetrics `json:"entries"`
 }
 
-// LoadSnapshot reads the snapshot from snapshotPath (if configured) and
-// replaces the in-memory state. Buckets older than the 7-day window are
-// dropped. A missing file is not an error; a corrupt file is logged and the
-// state is left empty. Should be called once at startup before any Record.
+type leaderboardSnapshotMetrics struct {
+	Sessions       uint64 `json:"sessions"`
+	DurationSumNS  uint64 `json:"duration_ns"`
+	DownloadMTUSum uint64 `json:"mtu_sum"`
+}
+
 func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
 	if l == nil {
 		return
@@ -280,22 +386,26 @@ func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
 		if day.Before(cutoff) || day.After(today) {
 			continue
 		}
-		counts := make(map[netip.Addr]uint64, len(sb.Counts))
-		for ipStr, c := range sb.Counts {
-			ip, err := netip.ParseAddr(ipStr)
-			if err != nil || !ip.IsValid() {
+		entries := make(map[netip.AddrPort]*resolverDailyEntry, len(sb.Entries))
+		for keyStr, m := range sb.Entries {
+			ap, err := netip.ParseAddrPort(keyStr)
+			if err != nil || !ap.Addr().IsValid() {
 				continue
 			}
-			if len(counts) >= resolverLeaderboardBucketCap {
+			if len(entries) >= resolverLeaderboardBucketCap {
 				break
 			}
-			counts[ip.Unmap()] = c
+			entries[ap] = &resolverDailyEntry{
+				Sessions:       m.Sessions,
+				DurationSumNS:  m.DurationSumNS,
+				DownloadMTUSum: m.DownloadMTUSum,
+			}
 		}
-		if len(counts) == 0 {
+		if len(entries) == 0 {
 			continue
 		}
-		buckets = append(buckets, &resolverDailyBucket{day: day, counts: counts})
-		loadedEntries += len(counts)
+		buckets = append(buckets, &resolverDailyBucket{day: day, entries: entries})
+		loadedEntries += len(entries)
 	}
 	slices.SortFunc(buckets, func(a, b *resolverDailyBucket) int {
 		return a.day.Compare(b.day)
@@ -314,9 +424,6 @@ func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
 	}
 }
 
-// MaybeSaveSnapshot writes a snapshot to disk if persistence is configured,
-// the state is dirty, and at least resolverLeaderboardSaveInterval has elapsed
-// since the last save. Errors are logged, not returned.
 func (l *resolverLeaderboard) MaybeSaveSnapshot(now time.Time) {
 	if l == nil {
 		return
@@ -349,7 +456,6 @@ func (l *resolverLeaderboard) MaybeSaveSnapshot(now time.Time) {
 	l.mu.Unlock()
 
 	if err := writeFileAtomic(path, payload); err != nil {
-		// Snapshot write failed; mark dirty again so we retry next tick.
 		l.mu.Lock()
 		l.dirtySinceSave = true
 		l.mu.Unlock()
@@ -362,8 +468,6 @@ func (l *resolverLeaderboard) MaybeSaveSnapshot(now time.Time) {
 	}
 }
 
-// FlushSnapshot forces a save regardless of dirtiness or save interval. Used on
-// graceful shutdown so the final state is persisted.
 func (l *resolverLeaderboard) FlushSnapshot(now time.Time) {
 	if l == nil {
 		return
@@ -406,36 +510,32 @@ func (l *resolverLeaderboard) serializeLocked() ([]byte, error) {
 	}
 	for _, b := range l.buckets {
 		entry := leaderboardSnapshotBucket{
-			Day:    b.day.Format(resolverLeaderboardDayLayout),
-			Counts: make(map[string]uint64, len(b.counts)),
+			Day:     b.day.Format(resolverLeaderboardDayLayout),
+			Entries: make(map[string]leaderboardSnapshotMetrics, len(b.entries)),
 		}
-		for ip, c := range b.counts {
-			entry.Counts[ip.String()] = c
+		for ap, e := range b.entries {
+			entry.Entries[ap.String()] = leaderboardSnapshotMetrics{
+				Sessions:       e.Sessions,
+				DurationSumNS:  e.DurationSumNS,
+				DownloadMTUSum: e.DownloadMTUSum,
+			}
 		}
 		snap.Buckets = append(snap.Buckets, entry)
 	}
 	return json.Marshal(snap)
 }
 
-// writeFileAtomic writes data to path via a temp file + rename so readers never
-// observe a partial write. The temp file path is deterministic (path+".tmp")
-// so a kill-9 between Write and Rename never leaks an unbounded number of
-// orphan files: the next successful save unlinks any prior tmp via os.Remove
-// before recreating it.
+// writeFileAtomic uses a deterministic tmp path + rename so a kill-9 between
+// Write and Rename cannot leak an unbounded number of orphan files: the next
+// successful save unlinks any prior tmp via os.Remove. O_EXCL defends against
+// a symlink planted at tmpPath between the Remove and the Open.
 func writeFileAtomic(path string, data []byte) error {
 	tmpPath := path + ".tmp"
 
-	// Unlink any stale tmp file from a prior crashed save. Errors other than
-	// "file does not exist" are returned: a stuck tmp file (permission denied,
-	// is-a-directory, etc.) means the next steps would fail too, so surface it
-	// now with a clear error.
 	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 
-	// O_EXCL guarantees we won't follow a symlink planted at tmpPath between
-	// the Remove above and this call. If we lose the race we return an error
-	// and retry next tick.
 	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err

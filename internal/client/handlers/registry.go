@@ -44,6 +44,9 @@ type ClientContext interface {
 	HandleSocksConnected(packet VpnProto.Packet) error
 	HandleSocksFailure(packet VpnProto.Packet) error
 	HandleSocksControlAck(packet VpnProto.Packet) error
+
+	// Resolver Recommendation Management
+	HandleResolverList(packet VpnProto.Packet) error
 }
 
 // HandlerFunc is the signature for all packet type handlers.

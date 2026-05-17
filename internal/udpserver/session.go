@@ -51,6 +51,8 @@ type sessionRecord struct {
 	Signature                           [sessionInitDataSize]byte
 	resolverSet                         map[netip.Addr]struct{}
 	resolverSetMu                       sync.Mutex
+	packetsReceived                     atomic.Uint64
+	lastListRequestUnixNano             atomic.Int64
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
 	CreatedAt                           time.Time
@@ -423,6 +425,7 @@ func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.
 		s.mu.RUnlock()
 		if result.Valid {
 			record.setLastActivity(now)
+			record.packetsReceived.Add(1)
 		}
 		return result
 	}
@@ -617,22 +620,43 @@ func isValidSessionResponseMode(value uint8) bool {
 
 const resolverSetMaxEntries = 64
 
-func (r *sessionRecord) noteResolver(ip netip.Addr) {
-	if r == nil || !ip.IsValid() {
+// isPubliclyRoutableIP returns true only for IPs that could plausibly serve as
+// a public DNS resolver. It rejects the IANA-reserved ranges that nobody else
+// can reach: loopback, RFC1918 private, link-local, multicast, unspecified.
+// Used to keep the leaderboard free of garbage — a client reporting
+// 192.168.1.1 as their DNS is technically truthful but useless to other users.
+func isPubliclyRoutableIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsPrivate() || ip.IsInterfaceLocalMulticast() {
+		return false
+	}
+	return true
+}
+
+// setResolverSet replaces the per-session resolver set wholesale with the
+// client's latest report. Entries beyond the cap are silently dropped (the
+// client should never send that many; cap defends against malformed reports).
+// Non-publicly-routable IPs are filtered out — see isPubliclyRoutableIP.
+func (r *sessionRecord) setResolverSet(ips []netip.Addr) {
+	if r == nil {
 		return
 	}
 	r.resolverSetMu.Lock()
 	defer r.resolverSetMu.Unlock()
-	if _, exists := r.resolverSet[ip]; exists {
-		return
+	r.resolverSet = make(map[netip.Addr]struct{}, len(ips))
+	for _, ip := range ips {
+		if !isPubliclyRoutableIP(ip) {
+			continue
+		}
+		if len(r.resolverSet) >= resolverSetMaxEntries {
+			break
+		}
+		r.resolverSet[ip] = struct{}{}
 	}
-	if r.resolverSet == nil {
-		r.resolverSet = make(map[netip.Addr]struct{}, 2)
-	}
-	if len(r.resolverSet) >= resolverSetMaxEntries {
-		return
-	}
-	r.resolverSet[ip] = struct{}{}
 }
 
 func (r *sessionRecord) resolverList() []netip.Addr {

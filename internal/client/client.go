@@ -33,10 +33,12 @@ const (
 )
 
 type Client struct {
-	cfg      config.ClientConfig
-	log      *logger.Logger
-	codec    *security.Codec
-	balancer *Balancer
+	cfg                 config.ClientConfig
+	log                 *logger.Logger
+	codec               *security.Codec
+	balancer            *Balancer
+	resolverReporter    *resolverReporter
+	resolverListFetcher *resolverListFetcher
 
 	successMTUChecks  bool
 	udpBufferPool     sync.Pool
@@ -325,7 +327,38 @@ func New(cfg config.ClientConfig, log *logger.Logger, codec *security.Codec) *Cl
 	})
 
 	c.pingManager = newPingManager(c)
+	c.resolverReporter = newResolverReporter(c, log)
+	c.resolverListFetcher = newResolverListFetcher(c, log)
+	c.balancer.SetActiveSetChangedHandler(c.resolverReporter.Trigger)
 	return c
+}
+
+// ServerRecommendedResolvers returns the most recent best-resolvers list
+// pushed by the server. Returns nil if none has been received yet. Safe to
+// call from any goroutine (used by the Android bridge).
+func (c *Client) ServerRecommendedResolvers() []ServerRecommendation {
+	if c == nil {
+		return nil
+	}
+	return c.resolverListFetcher.Snapshot()
+}
+
+// ServerRecommendedResolversReceivedAt returns the timestamp at which the
+// snapshot returned by ServerRecommendedResolvers was last updated. Zero
+// value means no list has been received yet this process lifetime.
+func (c *Client) ServerRecommendedResolversReceivedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	return c.resolverListFetcher.SnapshotReceivedAt()
+}
+
+func (c *Client) HandleResolverList(packet VpnProto.Packet) error {
+	if c == nil || c.resolverListFetcher == nil {
+		return nil
+	}
+	c.resolverListFetcher.ingestResponse(packet.Payload)
+	return nil
 }
 
 func (c *Client) nextSessionInitRetryDelay(failures int) time.Duration {

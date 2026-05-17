@@ -9,6 +9,7 @@ package udpserver
 
 import (
 	"context"
+	"net/netip"
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
@@ -64,9 +65,91 @@ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRec
 		return s.handleStreamCloseWriteRequest(vpnPacket)
 	case Enums.PACKET_STREAM_RST:
 		return s.handleStreamRSTRequest(vpnPacket)
+	case Enums.PACKET_RESOLVER_REPORT:
+		return s.handleResolverReportRequest(vpnPacket)
+	case Enums.PACKET_RESOLVER_LIST_REQUEST:
+		return s.handleResolverListRequest(vpnPacket)
 	default:
 		return false
 	}
+}
+
+const (
+	resolverListResponseTopN         = 25
+	resolverListRequestMinIntervalNS = int64(60 * time.Second)
+)
+
+func (s *Server) handleResolverListRequest(vpnPacket VpnProto.Packet) bool {
+	record, ok := s.sessions.Get(vpnPacket.SessionID)
+	if !ok || record == nil {
+		return true
+	}
+
+	nowNano := time.Now().UnixNano()
+	last := record.lastListRequestUnixNano.Load()
+	if last != 0 && nowNano-last < resolverListRequestMinIntervalNS {
+		return true
+	}
+	record.lastListRequestUnixNano.Store(nowNano)
+
+	if s.resolverLeaderboard == nil {
+		return true
+	}
+	top := s.resolverLeaderboard.TopForDistribution(resolverListResponseTopN)
+	entries := make([]VpnProto.ResolverListEntry, 0, len(top))
+	for _, t := range top {
+		entries = append(entries, VpnProto.ResolverListEntry{
+			IP:    t.AddrPort.Addr(),
+			Port:  t.AddrPort.Port(),
+			Score: t.Score,
+		})
+	}
+
+	payload := VpnProto.EncodeResolverList(entries)
+	queued := s.queueMainSessionPacket(record.ID, VpnProto.Packet{
+		PacketType: Enums.PACKET_RESOLVER_LIST_RESPONSE,
+		Payload:    payload,
+	})
+	if queued && s.log != nil {
+		s.log.Infof(
+			"\U0001F4E4 <green>Resolver List Sent, Session: <cyan>%d</cyan>, Entries: <cyan>%d</cyan></green>",
+			vpnPacket.SessionID, len(entries),
+		)
+	}
+	return true
+}
+
+func (s *Server) handleResolverReportRequest(vpnPacket VpnProto.Packet) bool {
+	record, ok := s.sessions.Get(vpnPacket.SessionID)
+	if !ok || record == nil {
+		return true
+	}
+
+	entries, err := VpnProto.DecodeResolverReport(vpnPacket.Payload)
+	if err != nil {
+		if s.debugLoggingEnabled() {
+			s.log.Debugf(
+				"\U0001F4CA <yellow>Resolver Report Parse Failed, Session: <cyan>%d</cyan>, Error: <cyan>%v</cyan></yellow>",
+				vpnPacket.SessionID, err,
+			)
+		}
+		return true
+	}
+
+	ips := make([]netip.Addr, 0, len(entries))
+	for _, e := range entries {
+		ips = append(ips, e.IP)
+	}
+	record.setResolverSet(ips)
+
+	if s.log != nil {
+		s.log.Infof(
+			"\U0001F4CA <green>Resolver Report Received, Session: <cyan>%d</cyan>, Resolvers: <cyan>%s</cyan></green>",
+			vpnPacket.SessionID,
+			resolverListDisplay(record.resolverList()),
+		)
+	}
+	return true
 }
 
 func (s *Server) enqueueMissingStreamReset(record *sessionRecord, vpnPacket VpnProto.Packet) bool {

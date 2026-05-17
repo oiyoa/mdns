@@ -69,7 +69,8 @@ func DefaultPacketPriority(packetType uint8) int {
 		return PacketPriorityNormal
 
 	case PACKET_STREAM_CLOSE_WRITE,
-		PACKET_SESSION_CLOSE:
+		PACKET_SESSION_CLOSE,
+		PACKET_RESOLVER_REPORT:
 		return PacketPriorityLow
 
 	case PACKET_PING,

@@ -59,6 +59,9 @@ func (m *packedTestClientContext) HandleSocksFailure(packet VpnProto.Packet) err
 func (m *packedTestClientContext) HandleSocksControlAck(packet VpnProto.Packet) error {
 	return nil
 }
+func (m *packedTestClientContext) HandleResolverList(packet VpnProto.Packet) error {
+	return nil
+}
 
 func TestPackedControlBlocksPreprocessesInnerPacketsBeforeDispatch(t *testing.T) {
 	ctx := &packedTestClientContext{}

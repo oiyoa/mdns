@@ -10,7 +10,6 @@ package udpserver
 import (
 	"errors"
 	"fmt"
-	"net"
 	"time"
 
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
@@ -19,7 +18,7 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
-func (s *Server) handlePacket(packet []byte, addr *net.UDPAddr) []byte {
+func (s *Server) handlePacket(packet []byte) []byte {
 	parsed, err := DnsParser.ParseDNSRequestLite(packet)
 	if err != nil {
 		if errors.Is(err, DnsParser.ErrNotDNSRequest) || errors.Is(err, DnsParser.ErrPacketTooShort) {
@@ -35,7 +34,7 @@ func (s *Server) handlePacket(packet []byte, addr *net.UDPAddr) []byte {
 
 	decision := s.domainMatcher.Match(parsed)
 	if decision.Action == domainMatcher.ActionProcess {
-		response := s.handleTunnelCandidate(packet, parsed, decision, addr)
+		response := s.handleTunnelCandidate(packet, parsed, decision)
 		if response != nil {
 			return response
 		}
@@ -50,7 +49,7 @@ func (s *Server) handlePacket(packet []byte, addr *net.UDPAddr) []byte {
 	return s.buildNoDataResponseLiteLogged(packet, parsed, "domain-match-no-data")
 }
 
-func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, addr *net.UDPAddr) []byte {
+func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision) []byte {
 	vpnPacket, err := VpnProto.ParseInflatedFromLabels(decision.Labels, s.codec)
 	if err != nil {
 		return s.buildNoDataResponseLiteLogged(packet, parsed, "vpn-proto-parse-failed")
@@ -67,10 +66,6 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 			return validation.response
 		}
 
-		if record, ok := s.sessions.Get(vpnPacket.SessionID); ok {
-			record.noteResolver(resolverFromUDPAddr(addr))
-		}
-
 		if !s.handlePostSessionPacket(vpnPacket, validation.record) {
 			return s.buildNoDataResponseLiteLogged(packet, parsed, fmt.Sprintf("post-session-unhandled-%s", Enums.PacketTypeName(vpnPacket.PacketType)))
 		}
@@ -84,7 +79,7 @@ func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacke
 	case Enums.PACKET_MTU_DOWN_REQ:
 		return s.handleMTUDownRequest(packet, parsed, decision, vpnPacket)
 	case Enums.PACKET_SESSION_INIT:
-		return s.handleSessionInitRequest(packet, decision, vpnPacket, addr)
+		return s.handleSessionInitRequest(packet, decision, vpnPacket)
 	default:
 		return s.buildNoDataResponseLiteLogged(packet, parsed, fmt.Sprintf("pre-session-unhandled-%s", Enums.PacketTypeName(vpnPacket.PacketType)))
 	}

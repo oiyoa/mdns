@@ -220,7 +220,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 				return
 			}
 
-			response := s.safeHandlePacket(req.buf[:req.size], req.addr)
+			response := s.safeHandlePacket(req.buf[:req.size])
 			if len(response) != 0 {
 				writeConn := conn
 				if req.conn != nil {
@@ -241,7 +241,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 	}
 }
 
-func (s *Server) safeHandlePacket(packet []byte, addr *net.UDPAddr) (response []byte) {
+func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if s.log != nil {
@@ -254,7 +254,7 @@ func (s *Server) safeHandlePacket(packet []byte, addr *net.UDPAddr) (response []
 		}
 	}()
 
-	return s.handlePacket(packet, addr)
+	return s.handlePacket(packet)
 }
 
 func (s *Server) onDrop(addr *net.UDPAddr, queueLen int, queueCap int) {

@@ -77,6 +77,13 @@ const (
 	PACKET_SESSION_CLOSE = 0x36 // 54
 	PACKET_SESSION_BUSY  = 0x37 // 55
 
+	// Client-to-server resolver inventory report. Sent post-session, replaces
+	// the server's idea of which DNS resolvers the client is actively using.
+	PACKET_RESOLVER_REPORT = 0x38 // 56
+
+	PACKET_RESOLVER_LIST_REQUEST  = 0x39 // 57
+	PACKET_RESOLVER_LIST_RESPONSE = 0x3A // 58
+
 	// Generic error packets
 	PACKET_ERROR_DROP = 0xFF // 255
 )

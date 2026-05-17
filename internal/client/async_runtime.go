@@ -85,6 +85,14 @@ func (c *Client) StopAsyncRuntime() {
 		c.pingManager.Stop()
 	}
 
+	if c.resolverReporter != nil {
+		c.resolverReporter.Stop()
+	}
+
+	if c.resolverListFetcher != nil {
+		c.resolverListFetcher.Stop()
+	}
+
 	c.resetRuntimeBindings(false)
 }
 
@@ -377,6 +385,15 @@ func (c *Client) StartAsyncRuntime(parentCtx context.Context) error {
 	// 9. Stream lifecycle cleanup.
 	c.asyncWG.Add(1)
 	go c.asyncStreamCleanupWorker(runtimeCtx)
+
+	// 10. Resolver-set reporter.
+	if c.resolverReporter != nil {
+		c.resolverReporter.Start(runtimeCtx)
+	}
+
+	if c.resolverListFetcher != nil {
+		c.resolverListFetcher.Start(runtimeCtx)
+	}
 
 	started = true
 	return nil

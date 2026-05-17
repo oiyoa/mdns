@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"net/netip"
 	"strings"
 	"time"
@@ -94,13 +93,6 @@ func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, now time.Ti
 	}
 }
 
-func resolverDisplay(ip netip.Addr) string {
-	if !ip.IsValid() {
-		return "unknown"
-	}
-	return ip.String()
-}
-
 func resolverListDisplay(ips []netip.Addr) string {
 	if len(ips) == 0 {
 		return "unknown"
@@ -110,17 +102,6 @@ func resolverListDisplay(ips []netip.Addr) string {
 		parts = append(parts, ip.String())
 	}
 	return strings.Join(parts, ",")
-}
-
-func resolverFromUDPAddr(addr *net.UDPAddr) netip.Addr {
-	if addr == nil {
-		return netip.Addr{}
-	}
-	ip, ok := netip.AddrFromSlice(addr.IP)
-	if !ok {
-		return netip.Addr{}
-	}
-	return ip.Unmap()
 }
 
 func (s *Server) logInvalidSessionDrop(reason string, sessionID uint8, receivedCookie uint8, expectedCookie uint8, responseMode uint8) {
@@ -264,7 +245,12 @@ func (s *Server) cleanupClosedSession(sessionID uint8, record *sessionRecord) {
 		return
 	}
 	if record != nil && s.resolverLeaderboard != nil {
-		s.resolverLeaderboard.RecordSession(time.Now(), record.resolverList())
+		now := time.Now()
+		duration := now.Sub(record.CreatedAt)
+		packets := record.packetsReceived.Load()
+		if duration >= resolverLeaderboardMinSessionDuration && packets >= resolverLeaderboardMinPacketsRX {
+			s.resolverLeaderboard.RecordSession(now, record.resolverList(), duration, record.DownloadMTU)
+		}
 	}
 	s.clearDeferredPacketsForSession(sessionID)
 	s.removeSOCKS5SynFragmentsForSession(sessionID)
@@ -718,7 +704,7 @@ func buildPreSessionPacketTypes() [256]bool {
 	return values
 }
 
-func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet, addr *net.UDPAddr) []byte {
+func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domainMatcher.Decision, vpnPacket VpnProto.Packet) []byte {
 	if vpnPacket.SessionID != 0 || len(vpnPacket.Payload) != sessionInitDataSize {
 		return nil
 	}
@@ -752,15 +738,11 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	}
 	record.streamCleanup = s.cleanupStreamArtifacts
 
-	resolverIP := resolverFromUDPAddr(addr)
-	record.noteResolver(resolverIP)
-
 	if !reused {
 		if s.log != nil {
 			s.log.Infof(
-				"\U0001F9DD <green>Session Created, ID: <cyan>%d</cyan>, Resolver: <cyan>%s</cyan>, Mode: <cyan>%s</cyan>, Upload Compression: <cyan>%s</cyan>, Download Compression: <cyan>%s</cyan>, Client Upload MTU: <cyan>%d</cyan>, Client Download MTU: <cyan>%d</cyan>, Max Packed Blocks: <cyan>%d</cyan></green>",
+				"\U0001F9DD <green>Session Created, ID: <cyan>%d</cyan>, Mode: <cyan>%s</cyan>, Upload Compression: <cyan>%s</cyan>, Download Compression: <cyan>%s</cyan>, Client Upload MTU: <cyan>%d</cyan>, Client Download MTU: <cyan>%d</cyan>, Max Packed Blocks: <cyan>%d</cyan></green>",
 				record.ID,
-				resolverDisplay(resolverIP),
 				sessionResponseModeName(record.ResponseMode),
 				compression.TypeName(record.UploadCompression),
 				compression.TypeName(record.DownloadCompression),

@@ -105,6 +105,7 @@ type Balancer struct {
 	autoDisableTimeoutWindow time.Duration
 	onResolverDisabled       func(*Connection, string)
 	confirmResolverDown      func(*Connection, time.Duration) bool
+	onActiveSetChanged       func()
 }
 
 type connectionStats struct {
@@ -229,6 +230,42 @@ func (b *Balancer) SetConnections(connections []*Connection) {
 		b.stats = append(b.stats, &connectionStats{})
 	}
 
+}
+
+// AddConnections appends new resolver connections without disturbing
+// existing ones. Returns the subset that were actually added (skipping
+// duplicates by Key). New entries start inactive — the caller is expected
+// to MTU-probe them before promotion.
+func (b *Balancer) AddConnections(connections []*Connection) []Connection {
+	if b == nil || len(connections) == 0 {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	added := make([]Connection, 0, len(connections))
+	for _, conn := range connections {
+		if conn == nil || conn.Key == "" {
+			continue
+		}
+		if _, exists := b.indexByKey[conn.Key]; exists {
+			continue
+		}
+		copied := *conn
+		copied.IsValid = false
+		copied.UploadMTUBytes = 0
+		copied.UploadMTUChars = 0
+		copied.DownloadMTUBytes = 0
+		copied.MTUResolveTime = 0
+		copied.LastHealthCheckAt = time.Time{}
+		idx := len(b.connections)
+		b.connections = append(b.connections, copied)
+		b.indexByKey[copied.Key] = idx
+		b.inactiveIDs = append(b.inactiveIDs, idx)
+		b.stats = append(b.stats, &connectionStats{})
+		added = append(added, copied)
+	}
+	return added
 }
 
 func (b *Balancer) ActiveCount() int {
@@ -1196,6 +1233,7 @@ func (b *Balancer) addActiveIndexLocked(idx int) {
 		}
 	}
 	b.activeIDs = append(b.activeIDs, idx)
+	b.notifyActiveSetChangedLocked()
 }
 
 func (b *Balancer) addInactiveIndexLocked(idx int) {
@@ -1212,9 +1250,31 @@ func (b *Balancer) removeActiveIndexLocked(idx int) {
 		if activeIdx == idx {
 			b.activeIDs[i] = b.activeIDs[len(b.activeIDs)-1]
 			b.activeIDs = b.activeIDs[:len(b.activeIDs)-1]
+			b.notifyActiveSetChangedLocked()
 			break
 		}
 	}
+}
+
+// SetActiveSetChangedHandler registers a callback fired whenever the set of
+// active resolver indexes changes. The handler is invoked while the balancer
+// write lock is held, so it MUST be non-blocking and MUST NOT call back into
+// the Balancer (re-entering b.mu would deadlock). A non-blocking channel send
+// is the intended shape.
+func (b *Balancer) SetActiveSetChangedHandler(handler func()) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onActiveSetChanged = handler
+}
+
+func (b *Balancer) notifyActiveSetChangedLocked() {
+	if b == nil || b.onActiveSetChanged == nil {
+		return
+	}
+	b.onActiveSetChanged()
 }
 
 func (b *Balancer) removeInactiveIndexLocked(idx int) {

@@ -173,6 +173,13 @@ func (c *Client) applySessionInitPacket(packet VpnProto.Packet, initPayload []by
 		c.clearSessionInitBusyUntil()
 		c.resetSessionInitStateLocked()
 		c.clearSessionResetPending()
+		// Clear the dedupe cache so the new server-side session record
+		// receives a fresh report even if the balancer's active set is
+		// identical to the previous session's.
+		c.resolverReporter.ResetLastSent()
+		c.resolverReporter.Trigger()
+		c.resolverListFetcher.ResetForNewSession()
+		c.resolverListFetcher.Trigger()
 		return nil
 	default:
 		return ErrSessionInitFailed
