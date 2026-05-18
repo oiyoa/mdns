@@ -8,23 +8,18 @@ KEY_FILE="${KEY_FILE:-encrypt_key.txt}"
 BIN="${APP_DIR}/masterdnsvpn"
 SAMPLE_URL="https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_config.toml.simple"
 
-mkdir -p "${APP_DIR}" "${DATA_DIR}"
-cd "${APP_DIR}"
+CONFIG_PATH="${DATA_DIR}/${CONFIG_FILE}"
+KEY_PATH="${DATA_DIR}/${KEY_FILE}"
 
-copy_if_exists() {
-  local src="$1"
-  local dst="$2"
-  if [[ -f "${src}" ]]; then
-    cp -f "${src}" "${dst}"
-  fi
-}
+mkdir -p "${DATA_DIR}"
+cd "${DATA_DIR}"
 
 bootstrap_config() {
   local domain_value tmp_config
 
   domain_value="${DOMAIN:-}"
   if [[ -z "${domain_value}" ]]; then
-    echo "ERROR: DOMAIN env is required when /data/${CONFIG_FILE} does not exist." >&2
+    echo "ERROR: DOMAIN env is required when ${CONFIG_PATH} does not exist." >&2
     exit 1
   fi
 
@@ -34,8 +29,7 @@ bootstrap_config() {
   curl -fsSL --retry 3 --retry-delay 2 "${SAMPLE_URL}" -o "${tmp_config}"
 
   domain_value="${domain_value//&/\\&}"
-  sed -E "s|^DOMAIN[[:space:]]*=.*$|DOMAIN = [\"${domain_value}\"]|" "${tmp_config}" > "${APP_DIR}/${CONFIG_FILE}"
-  cp -f "${APP_DIR}/${CONFIG_FILE}" "${DATA_DIR}/${CONFIG_FILE}" 2>/dev/null || true
+  sed -E "s|^DOMAIN[[:space:]]*=.*$|DOMAIN = [\"${domain_value}\"]|" "${tmp_config}" > "${CONFIG_PATH}"
   rm -f "${tmp_config}"
   trap - EXIT
 }
@@ -45,17 +39,13 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-# Prefer persisted config/key if present.
-copy_if_exists "${DATA_DIR}/${CONFIG_FILE}" "${APP_DIR}/${CONFIG_FILE}"
-copy_if_exists "${DATA_DIR}/${KEY_FILE}" "${APP_DIR}/${KEY_FILE}"
-
-if [[ ! -f "${APP_DIR}/${CONFIG_FILE}" ]]; then
+if [[ ! -f "${CONFIG_PATH}" ]]; then
   bootstrap_config
 fi
 
-if [[ ! -s "${APP_DIR}/${KEY_FILE}" ]]; then
+if [[ ! -s "${KEY_PATH}" ]]; then
   tmp_log="$(mktemp)"
-  if ! "${BIN}" -genkey -nowait >"${tmp_log}" 2>&1; then
+  if ! "${BIN}" -genkey -nowait -config "${CONFIG_PATH}" >"${tmp_log}" 2>&1; then
     tail -n 100 "${tmp_log}" >&2 || true
     rm -f "${tmp_log}"
     exit 1
@@ -63,7 +53,4 @@ if [[ ! -s "${APP_DIR}/${KEY_FILE}" ]]; then
   rm -f "${tmp_log}"
 fi
 
-cp -f "${APP_DIR}/${CONFIG_FILE}" "${DATA_DIR}/${CONFIG_FILE}" 2>/dev/null || true
-cp -f "${APP_DIR}/${KEY_FILE}" "${DATA_DIR}/${KEY_FILE}" 2>/dev/null || true
-
-exec "${BIN}" -nowait "$@"
+exec "${BIN}" -nowait -config "${CONFIG_PATH}" "$@"
