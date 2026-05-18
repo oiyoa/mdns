@@ -52,6 +52,7 @@ type sessionRecord struct {
 	resolverSet                         map[netip.Addr]struct{}
 	resolverSetMu                       sync.Mutex
 	packetsReceived                     atomic.Uint64
+	streamsCreated                      atomic.Uint64
 	lastListRequestUnixNano             atomic.Int64
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
@@ -845,6 +846,9 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 	s := NewStreamServer(streamID, r.ID, arqConfig, localConn, r.DownloadMTUBytes, r.StreamQueueCap, logger)
 	s.onClosed = r.onStreamClosed
 	r.Streams[streamID] = s
+	if streamID != 0 {
+		r.streamsCreated.Add(1)
+	}
 
 	// Active streams tracking: keep sorted for Round-Robin predictability
 	found := slices.Contains(r.ActiveStreams, streamID)

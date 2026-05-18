@@ -83,11 +83,17 @@ func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, now time.Ti
 	}
 
 	resolvers := record.resolverList()
+	duration := now.Sub(record.CreatedAt).Round(time.Second)
+	packets := record.packetsReceived.Load()
+	streams := record.streamsCreated.Load()
 	s.cleanupClosedSession(vpnPacket.SessionID, record)
 	if s.log != nil {
 		s.log.Infof(
-			"\U0001F6AA <green>Session Closed By Client, Session: <cyan>%d</cyan>, Resolvers: <cyan>%s</cyan></green>",
+			"\U0001F6AA <green>Session Closed By Client, Session: <cyan>%d</cyan>, Duration: <cyan>%s</cyan>, Packets RX: <cyan>%d</cyan>, Streams: <cyan>%d</cyan>, Resolvers: <cyan>%s</cyan></green>",
 			vpnPacket.SessionID,
+			duration,
+			packets,
+			streams,
 			resolverListDisplay(resolvers),
 		)
 	}
