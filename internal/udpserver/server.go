@@ -84,6 +84,11 @@ type Server struct {
 	lastDeferredDropLogUnix  atomic.Int64
 	pongNonce                atomic.Uint32
 	invalidDropMode          atomic.Uint32
+	statsLifetimeBytesRX     atomic.Uint64
+	statsLifetimeBytesTX     atomic.Uint64
+	statsLifetimePacketsRX   atomic.Uint64
+	statsLifetimePacketsTX   atomic.Uint64
+	stats                    statsState
 }
 
 type request struct {

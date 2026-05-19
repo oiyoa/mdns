@@ -41,6 +41,7 @@ type ServerConfig struct {
 	InvalidCookieErrorThreshold       int      `toml:"INVALID_COOKIE_ERROR_THRESHOLD"`
 	SessionTimeoutSecs                float64  `toml:"SESSION_TIMEOUT_SECONDS"`
 	SessionCleanupIntervalSecs        float64  `toml:"SESSION_CLEANUP_INTERVAL_SECONDS"`
+	StatsReportIntervalSecs           float64  `toml:"STATS_REPORT_INTERVAL_SECONDS"`
 	ClosedSessionRetentionSecs        float64  `toml:"CLOSED_SESSION_RETENTION_SECONDS"`
 	SessionInitReuseTTLSeconds        float64  `toml:"SESSION_INIT_REUSE_TTL_SECONDS"`
 	RecentlyClosedStreamTTLSeconds    float64  `toml:"RECENTLY_CLOSED_STREAM_TTL_SECONDS"`
@@ -129,6 +130,7 @@ func defaultServerConfig() ServerConfig {
 		InvalidCookieErrorThreshold:       10,
 		SessionTimeoutSecs:                300.0,
 		SessionCleanupIntervalSecs:        30.0,
+		StatsReportIntervalSecs:           300.0,
 		ClosedSessionRetentionSecs:        600.0,
 		SessionInitReuseTTLSeconds:        600.0,
 		RecentlyClosedStreamTTLSeconds:    600.0,
@@ -346,6 +348,10 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 		cfg.SessionCleanupIntervalSecs = 30.0
 	}
 
+	if cfg.StatsReportIntervalSecs <= 0 {
+		cfg.StatsReportIntervalSecs = 300.0
+	}
+
 	if cfg.ClosedSessionRetentionSecs <= 0 {
 		cfg.ClosedSessionRetentionSecs = 600.0
 	}
@@ -491,6 +497,10 @@ func (c ServerConfig) SessionTimeout() time.Duration {
 
 func (c ServerConfig) SessionCleanupInterval() time.Duration {
 	return time.Duration(c.SessionCleanupIntervalSecs * float64(time.Second))
+}
+
+func (c ServerConfig) StatsReportInterval() time.Duration {
+	return time.Duration(c.StatsReportIntervalSecs * float64(time.Second))
 }
 
 func (c ServerConfig) ClosedSessionRetention() time.Duration {

@@ -150,16 +150,17 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 			for _, idleSession := range idleDeferred {
 				s.cleanupIdleDeferredSession(idleSession.ID, idleSession.lastActivityNano, now)
 			}
-			if len(expired) == 0 {
-				continue
-			}
 			for _, expiredSession := range expired {
 				s.cleanupClosedSession(expiredSession.ID, expiredSession.record)
+				s.logSessionClosed(expiredSession.ID, expiredSession.record, now, "idle_timeout")
 			}
-			s.log.Infof(
-				"\U0001F4E1 <green>Expired Sessions Cleaned, Count: <cyan>%d</cyan></green>",
-				len(expired),
-			)
+			if len(expired) > 0 {
+				s.log.Infof(
+					"\U0001F4E1 <green>Expired Sessions Cleaned, Count: <cyan>%d</cyan></green>",
+					len(expired),
+				)
+			}
+			s.maybeEmitServerStats(now, s.cfg.StatsReportInterval())
 		}
 	}
 }

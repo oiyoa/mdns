@@ -52,6 +52,16 @@ type sessionRecord struct {
 	resolverSet                         map[netip.Addr]struct{}
 	resolverSetMu                       sync.Mutex
 	packetsReceived                     atomic.Uint64
+	packetsSent                         atomic.Uint64
+	bytesReceived                       atomic.Uint64
+	bytesSent                           atomic.Uint64
+	peakActiveStreams                   atomic.Uint32
+	bucketMu                            sync.Mutex
+	bucketStartSec                      int64
+	bucketBytesRX                       uint64
+	bucketBytesTX                       uint64
+	peakBytesPerSecondRX                uint64
+	peakBytesPerSecondTX                uint64
 	streamsCreated                      atomic.Uint64
 	lastListRequestUnixNano             atomic.Int64
 	MaxPackedBlocks                     int
@@ -373,6 +383,87 @@ func (s *sessionStore) Get(sessionID uint8) (*sessionRecord, bool) {
 	return record, true
 }
 
+func (s *sessionStore) NotePacketTX(sessionID uint8, payloadBytes int, now time.Time) {
+	if s == nil || sessionID == 0 {
+		return
+	}
+	s.mu.RLock()
+	record := s.byID[sessionID]
+	s.mu.RUnlock()
+	if record == nil {
+		return
+	}
+	record.packetsSent.Add(1)
+	if payloadBytes > 0 {
+		record.bytesSent.Add(uint64(payloadBytes))
+		record.noteBucketBytes(0, uint64(payloadBytes), now)
+	}
+}
+
+// noteBucketBytes adds payload bytes to the per-second rolling bucket. direction
+// 1 == RX (inbound from client), 0 == TX (outbound to client). When the wall
+// clock advances past the current bucket second, the closed bucket is folded
+// into the per-direction peak and active-second counters before the new bucket
+// is opened. Callers must pass the current wall-clock time so that all
+// observers agree on a bucket boundary.
+func (r *sessionRecord) noteBucketBytes(direction int, n uint64, now time.Time) {
+	if r == nil || n == 0 {
+		return
+	}
+	nowSec := now.Unix()
+	r.bucketMu.Lock()
+	if r.bucketStartSec != nowSec {
+		r.closeBucketLocked()
+		r.bucketStartSec = nowSec
+	}
+	if direction == 1 {
+		r.bucketBytesRX += n
+	} else {
+		r.bucketBytesTX += n
+	}
+	r.bucketMu.Unlock()
+}
+
+// closeBucketLocked folds the current bucket's per-direction byte tallies into
+// the session's peak-throughput counters, then zeroes the bucket so the next
+// observation can start fresh. Caller must hold bucketMu.
+func (r *sessionRecord) closeBucketLocked() {
+	if r.bucketBytesRX > 0 {
+		if r.bucketBytesRX > r.peakBytesPerSecondRX {
+			r.peakBytesPerSecondRX = r.bucketBytesRX
+		}
+		r.bucketBytesRX = 0
+	}
+	if r.bucketBytesTX > 0 {
+		if r.bucketBytesTX > r.peakBytesPerSecondTX {
+			r.peakBytesPerSecondTX = r.bucketBytesTX
+		}
+		r.bucketBytesTX = 0
+	}
+}
+
+// throughputSnapshot returns the per-direction peak 1-second throughput
+// observed during the session. It flushes the in-progress bucket first so a
+// session that received a burst right before close still has that second
+// counted.
+func (r *sessionRecord) throughputSnapshot() (peakRX, peakTX uint64) {
+	r.bucketMu.Lock()
+	r.closeBucketLocked()
+	peakRX = r.peakBytesPerSecondRX
+	peakTX = r.peakBytesPerSecondTX
+	r.bucketMu.Unlock()
+	return
+}
+
+func (s *sessionStore) ActiveCount() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return int(s.activeCount)
+}
+
 func (s *sessionStore) HasActive(sessionID uint8) bool {
 	if s == nil || sessionID == 0 {
 		return false
@@ -407,7 +498,7 @@ func (s *sessionStore) Lookup(sessionID uint8) (sessionLookupResult, bool) {
 	return sessionLookupResult{}, false
 }
 
-func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.Time) sessionValidationResult {
+func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, payloadBytes int, now time.Time) sessionValidationResult {
 	s.mu.RLock()
 	if record := s.byID[sessionID]; record != nil {
 		result := sessionValidationResult{
@@ -427,6 +518,10 @@ func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.
 		if result.Valid {
 			record.setLastActivity(now)
 			record.packetsReceived.Add(1)
+			if payloadBytes > 0 {
+				record.bytesReceived.Add(uint64(payloadBytes))
+				record.noteBucketBytes(1, uint64(payloadBytes), now)
+			}
 		}
 		return result
 	}
@@ -869,9 +964,23 @@ func (r *sessionRecord) getOrCreateStream(streamID uint16, arqConfig arq.Config,
 			r.ActiveStreams[insertAt] = streamID
 		}
 		r.markActiveStreamsChangedLocked()
+		r.notePeakActiveStreamsLocked()
 	}
 
 	return s
+}
+
+func (r *sessionRecord) notePeakActiveStreamsLocked() {
+	count := uint32(len(r.ActiveStreams))
+	for {
+		current := r.peakActiveStreams.Load()
+		if count <= current {
+			return
+		}
+		if r.peakActiveStreams.CompareAndSwap(current, count) {
+			return
+		}
+	}
 }
 
 func (r *sessionRecord) canCreateAdditionalStream(streamID uint16) bool {

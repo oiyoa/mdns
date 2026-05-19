@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -204,6 +205,8 @@ type ARQ struct {
 	controlPacketTTL         time.Duration
 	dataAdaptiveRTO          adaptiveRTOState
 	controlAdaptiveRTO       adaptiveRTOState
+	dataRetransmits          atomic.Uint64
+	controlRetransmits       atomic.Uint64
 	dataNackMaxGap           int
 	dataNackInitialDelay     time.Duration
 	dataNackRepeatInterval   time.Duration
@@ -313,6 +316,36 @@ func (a *ARQ) IsClosed() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.closed
+}
+
+// DataSRTT returns the smoothed round-trip time estimate for ack'd data
+// packets. Returns 0 if no RTT sample has been taken yet (newly opened stream
+// or one that has not received any acks). This is a fresh observation under
+// the read lock, not a snapshot — concurrent samples are accepted.
+func (a *ARQ) DataSRTT() time.Duration {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.dataAdaptiveRTO.initialized {
+		return 0
+	}
+	return a.dataAdaptiveRTO.srtt
+}
+
+// ControlSRTT returns the smoothed RTT estimate for ack'd control packets.
+// Returns 0 if no control RTT sample has been taken.
+func (a *ARQ) ControlSRTT() time.Duration {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.controlAdaptiveRTO.initialized {
+		return 0
+	}
+	return a.controlAdaptiveRTO.srtt
+}
+
+// RetransmitCounts returns lifetime retransmit counts for this stream as
+// (data, control). Each value increments once per packet re-enqueue event.
+func (a *ARQ) RetransmitCounts() (data, control uint64) {
+	return a.dataRetransmits.Load(), a.controlRetransmits.Load()
 }
 
 func (a *ARQ) State() StreamState {
@@ -2425,6 +2458,7 @@ func (a *ARQ) checkRetransmits() {
 				maxRTO = drainRTOCap
 			}
 			info.CurrentRTO = clampDuration(grownRTO, dataFloor, maxRTO)
+			a.dataRetransmits.Add(1)
 		}
 		a.mu.Unlock()
 	}
@@ -2665,6 +2699,7 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 		info.Dispatched = false
 		info.Retries++
 		info.SampleEligible = false
+		a.controlRetransmits.Add(1)
 		growth := controlRetransmitRTOGrowthFactor
 		floorRto := a.currentControlBaseRTO()
 

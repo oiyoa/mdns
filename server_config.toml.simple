@@ -96,6 +96,9 @@ SESSION_TIMEOUT_SECONDS = 300.0
 # How often the background cleanup loop runs.
 SESSION_CLEANUP_INTERVAL_SECONDS = 30.0
 
+# How often the server-wide stats line is emitted.
+STATS_REPORT_INTERVAL_SECONDS = 300.0
+
 # How long closed-session metadata is kept after cleanup.
 CLOSED_SESSION_RETENTION_SECONDS = 600.0
 

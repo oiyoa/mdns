@@ -25,8 +25,9 @@ import (
 
 func (s *Server) validatePostSessionPacket(questionPacket []byte, requestName string, vpnPacket VpnProto.Packet) postSessionValidation {
 	now := time.Now()
-	validation := s.sessions.ValidateAndTouch(vpnPacket.SessionID, vpnPacket.SessionCookie, now)
+	validation := s.sessions.ValidateAndTouch(vpnPacket.SessionID, vpnPacket.SessionCookie, len(vpnPacket.Payload), now)
 	if validation.Valid {
+		s.noteServerRX(len(vpnPacket.Payload))
 		return postSessionValidation{
 			record: validation.Active,
 			ok:     true,
@@ -82,21 +83,44 @@ func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, now time.Ti
 		return
 	}
 
-	resolvers := record.resolverList()
-	duration := now.Sub(record.CreatedAt).Round(time.Second)
-	packets := record.packetsReceived.Load()
-	streams := record.streamsCreated.Load()
 	s.cleanupClosedSession(vpnPacket.SessionID, record)
-	if s.log != nil {
-		s.log.Infof(
-			"\U0001F6AA <green>Session Closed By Client, Session: <cyan>%d</cyan>, Duration: <cyan>%s</cyan>, Packets RX: <cyan>%d</cyan>, Streams: <cyan>%d</cyan>, Resolvers: <cyan>%s</cyan></green>",
-			vpnPacket.SessionID,
-			duration,
-			packets,
-			streams,
-			resolverListDisplay(resolvers),
-		)
+	s.logSessionClosed(vpnPacket.SessionID, record, now, "client_close")
+}
+
+func (s *Server) logSessionClosed(sessionID uint8, record *sessionRecord, now time.Time, reason string) {
+	if s == nil || s.log == nil || record == nil {
+		return
 	}
+	duration := now.Sub(record.CreatedAt)
+	if duration < 0 {
+		duration = 0
+	}
+	packetsRX := record.packetsReceived.Load()
+	packetsTX := record.packetsSent.Load()
+	bytesRX := record.bytesReceived.Load()
+	bytesTX := record.bytesSent.Load()
+	streams := record.streamsCreated.Load()
+	peakStreams := record.peakActiveStreams.Load()
+	peakRX, peakTX := record.throughputSnapshot()
+	resolvers := record.resolverList()
+
+	s.log.Infof(
+		"\U0001F6AA <green>Session Closed</green> <magenta>|</magenta> <blue>Reason</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Duration</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>RX</blue>: <cyan>%s</cyan> avg <cyan>%s</cyan>, peak <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts) <magenta>|</magenta> <blue>TX</blue>: <cyan>%s</cyan> avg <cyan>%s</cyan>, peak <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts) <magenta>|</magenta> <blue>Streams</blue>: <cyan>%d</cyan> created, peak active <cyan>%d</cyan> <magenta>|</magenta> <blue>Resolvers</blue>: <cyan>%s</cyan>",
+		reason,
+		sessionID,
+		duration.Round(time.Second),
+		formatBytes(bytesRX),
+		formatThroughput(bytesRX, duration),
+		formatBytes(peakRX),
+		packetsRX,
+		formatBytes(bytesTX),
+		formatThroughput(bytesTX, duration),
+		formatBytes(peakTX),
+		packetsTX,
+		streams,
+		peakStreams,
+		resolverListDisplay(resolvers),
+	)
 }
 
 func resolverListDisplay(ips []netip.Addr) string {
@@ -192,6 +216,8 @@ func (s *Server) buildSessionVPNResponse(questionPacket []byte, requestName stri
 	if err != nil {
 		return nil
 	}
+	s.sessions.NotePacketTX(record.ID, len(packet.Payload), time.Now())
+	s.noteServerTX(len(packet.Payload))
 	return response
 }
 
