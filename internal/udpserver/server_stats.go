@@ -9,8 +9,8 @@ package udpserver
 
 import (
 	"fmt"
-	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,18 +23,26 @@ const (
 	// statsActiveCountChangeMin is the minimum absolute change required to
 	// trigger a threshold emit even if the ratio is met.
 	statsActiveCountChangeMin = 5
+	// statsHeartbeatInterval forces a stats line even when nothing has changed,
+	// so admins watching the log can confirm the server is alive.
+	statsHeartbeatInterval = 1 * time.Hour
 )
 
-// statsState tracks server-wide stats counters and their last-emit snapshot for
-// rate calculations. Snapshot fields are read/written only from the cleanup
-// loop goroutine, so a single mutex guards them.
+// statsState tracks the last sampled snapshot of server-wide counters so the
+// next emit can compute deltas, plus the timestamp of the last *actual* log
+// line so heartbeats and idle-skip can be decided independently of how often
+// we sample. Guarded by mu.
 type statsState struct {
 	mu                 sync.Mutex
-	lastEmit           time.Time
+	initialized        bool
+	lastSnapshotAt     time.Time
+	lastLogAt          time.Time
 	lastBytesRX        uint64
 	lastBytesTX        uint64
 	lastPacketsRX      uint64
 	lastPacketsTX      uint64
+	lastDataRetx       uint64
+	lastCtrlRetx       uint64
 	lastActiveCount    int
 	peakActiveSessions int
 }
@@ -59,10 +67,14 @@ func (s *Server) noteServerTX(payloadBytes int) {
 	}
 }
 
-// maybeEmitServerStats decides whether to emit a periodic server-wide stats
-// line. It emits when at least interval has passed since the last emit, OR
-// when the active session count has changed substantially (high-water mark,
-// drop to zero, or large jump). Returns true if a log line was emitted.
+// maybeEmitServerStats samples server-wide counters and decides whether to log
+// a stats line this tick. The snapshot is always advanced so delta math stays
+// correct, but the log itself is suppressed when nothing interesting has
+// happened: zero active sessions and zero packets since the last sample. A
+// heartbeat line is forced at most once per hour so admins know the process is
+// alive even when fully idle. The line itself is built from conditional
+// segments — fields that have nothing to say are simply omitted instead of
+// being logged as zeros.
 func (s *Server) maybeEmitServerStats(now time.Time, interval time.Duration) bool {
 	if s == nil || s.log == nil {
 		return false
@@ -73,7 +85,7 @@ func (s *Server) maybeEmitServerStats(now time.Time, interval time.Duration) boo
 	defer state.mu.Unlock()
 
 	active := s.sessions.ActiveCount()
-	scheduled := state.lastEmit.IsZero() || (interval > 0 && now.Sub(state.lastEmit) >= interval)
+	scheduled := !state.initialized || (interval > 0 && now.Sub(state.lastSnapshotAt) >= interval)
 	threshold := s.activeCountCrossedThresholdLocked(state, active)
 
 	if !scheduled && !threshold {
@@ -85,66 +97,124 @@ func (s *Server) maybeEmitServerStats(now time.Time, interval time.Duration) boo
 	packetsRX := s.statsLifetimePacketsRX.Load()
 	packetsTX := s.statsLifetimePacketsTX.Load()
 
+	var deltaBytesRX, deltaBytesTX, deltaPacketsRX, deltaPacketsTX uint64
 	var elapsed time.Duration
-	if !state.lastEmit.IsZero() {
-		elapsed = now.Sub(state.lastEmit)
+	if state.initialized {
+		elapsed = now.Sub(state.lastSnapshotAt)
+		deltaBytesRX = bytesRX - state.lastBytesRX
+		deltaBytesTX = bytesTX - state.lastBytesTX
+		deltaPacketsRX = packetsRX - state.lastPacketsRX
+		deltaPacketsTX = packetsTX - state.lastPacketsTX
 	}
 
-	deltaBytesRX := bytesRX - state.lastBytesRX
-	deltaBytesTX := bytesTX - state.lastBytesTX
-	deltaPacketsRX := packetsRX - state.lastPacketsRX
-	deltaPacketsTX := packetsTX - state.lastPacketsTX
-
-	rateRX, rateTX := bytesPerSecond(deltaBytesRX, elapsed), bytesPerSecond(deltaBytesTX, elapsed)
+	idle := active == 0
+	heartbeatDue := state.initialized && !state.lastLogAt.IsZero() && now.Sub(state.lastLogAt) >= statsHeartbeatInterval
+	startup := !state.initialized
+	shouldLog := threshold || heartbeatDue || startup || !idle
 
 	if active > state.peakActiveSessions {
 		state.peakActiveSessions = active
 	}
-	peakActive := state.peakActiveSessions
 
-	state.lastEmit = now
+	state.initialized = true
+	state.lastSnapshotAt = now
 	state.lastBytesRX = bytesRX
 	state.lastBytesTX = bytesTX
 	state.lastPacketsRX = packetsRX
 	state.lastPacketsTX = packetsTX
 	state.lastActiveCount = active
 
-	trigger := "scheduled"
-	if !scheduled && threshold {
-		trigger = "active-change"
+	if !shouldLog {
+		return false
 	}
 
-	queueDepth, queueSessions := s.sampleQueuePressure()
 	latency := s.sampleLatencyAndRetx()
-	memStats := readProcessStats()
+	queueDepth, queueSessions := s.sampleQueuePressure()
 
-	s.log.Infof(
-		"\U0001F4CA <green>Server Stats</green> <magenta>|</magenta> <blue>Trigger</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Active</blue>: <cyan>%d</cyan> (peak <cyan>%d</cyan>) <magenta>|</magenta> <blue>RX</blue>: <cyan>%s</cyan> @ <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts) <magenta>|</magenta> <blue>TX</blue>: <cyan>%s</cyan> @ <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts) <magenta>|</magenta> <blue>Lifetime</blue>: RX <cyan>%s</cyan> / TX <cyan>%s</cyan> <magenta>|</magenta> <blue>Latency</blue>: SRTT p50 <cyan>%s</cyan> / p95 <cyan>%s</cyan> across <cyan>%d</cyan>/<cyan>%d</cyan> streams <magenta>|</magenta> <blue>Retx</blue>: data <cyan>%d</cyan>, ctrl <cyan>%d</cyan> <magenta>|</magenta> <blue>Queues</blue>: orphan-depth <cyan>%d</cyan> across <cyan>%d</cyan> sess <magenta>|</magenta> <blue>Runtime</blue>: goroutines <cyan>%d</cyan>, heap <cyan>%s</cyan>, sys <cyan>%s</cyan>, gc <cyan>%d</cyan>",
-		trigger,
-		active,
-		peakActive,
-		formatBytes(deltaBytesRX),
-		formatBytes(rateRX),
-		deltaPacketsRX,
-		formatBytes(deltaBytesTX),
-		formatBytes(rateTX),
-		deltaPacketsTX,
-		formatBytes(bytesRX),
-		formatBytes(bytesTX),
-		formatDurationShort(latency.medianSRTT),
-		formatDurationShort(latency.p95SRTT),
-		latency.streamSamples,
-		latency.streamsObserved,
-		latency.totalDataRetx,
-		latency.totalCtrlRetx,
-		queueDepth,
-		queueSessions,
-		memStats.goroutines,
-		formatBytes(memStats.heapInUse),
-		formatBytes(memStats.sys),
-		memStats.numGC,
-	)
+	deltaDataRetx := latency.totalDataRetx
+	deltaCtrlRetx := latency.totalCtrlRetx
+	if state.initialized {
+		if latency.totalDataRetx >= state.lastDataRetx {
+			deltaDataRetx = latency.totalDataRetx - state.lastDataRetx
+		}
+		if latency.totalCtrlRetx >= state.lastCtrlRetx {
+			deltaCtrlRetx = latency.totalCtrlRetx - state.lastCtrlRetx
+		}
+	}
+	state.lastDataRetx = latency.totalDataRetx
+	state.lastCtrlRetx = latency.totalCtrlRetx
+	state.lastLogAt = now
+
+	trigger := pickTrigger(threshold, heartbeatDue, startup)
+	line := buildStatsLine(trigger, active, state.peakActiveSessions, elapsed,
+		deltaBytesRX, deltaBytesTX, deltaPacketsRX, deltaPacketsTX,
+		latency, deltaDataRetx, deltaCtrlRetx,
+		queueDepth, queueSessions)
+
+	s.log.Infof("%s", line)
 	return true
+}
+
+func pickTrigger(threshold, heartbeat, startup bool) string {
+	switch {
+	case startup:
+		return "startup"
+	case threshold:
+		return "active-change"
+	case heartbeat:
+		return "heartbeat"
+	default:
+		return ""
+	}
+}
+
+// buildStatsLine assembles the log line from conditional segments. Each
+// segment is appended only when its data is non-trivial — idle ticks that get
+// past the suppression check (heartbeat, startup) end up showing just the
+// liveness signals (active count, heap) without padding zeros for every
+// counter.
+func buildStatsLine(trigger string, active, peak int, elapsed time.Duration,
+	deltaBytesRX, deltaBytesTX, deltaPacketsRX, deltaPacketsTX uint64,
+	latency latencySample, deltaDataRetx, deltaCtrlRetx uint64,
+	queueDepth, queueSessions int) string {
+
+	segments := make([]string, 0, 8)
+
+	if trigger != "" && trigger != "scheduled" {
+		segments = append(segments, fmt.Sprintf("<blue>Trigger</blue>: <cyan>%s</cyan>", trigger))
+	}
+
+	activeSeg := fmt.Sprintf("<blue>Active</blue>: <cyan>%d</cyan>", active)
+	if peak > 0 && peak != active {
+		activeSeg += fmt.Sprintf(" (peak <cyan>%d</cyan>)", peak)
+	}
+	segments = append(segments, activeSeg)
+
+	if latency.streamsObserved > 0 {
+		segments = append(segments, fmt.Sprintf("<blue>Streams</blue>: <cyan>%d</cyan>", latency.streamsObserved))
+	}
+
+	if deltaBytesRX > 0 || deltaBytesTX > 0 {
+		rateRX := bytesPerSecond(deltaBytesRX, elapsed)
+		rateTX := bytesPerSecond(deltaBytesTX, elapsed)
+		segments = append(segments, fmt.Sprintf("<blue>RX</blue>: <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts) <magenta>·</magenta> <blue>TX</blue>: <cyan>%s/s</cyan> (<cyan>%d</cyan> pkts)",
+			formatBytes(rateRX), deltaPacketsRX, formatBytes(rateTX), deltaPacketsTX))
+	}
+
+	if latency.streamSamples > 0 {
+		segments = append(segments, fmt.Sprintf("<blue>SRTT</blue>: p50 <cyan>%s</cyan>, p95 <cyan>%s</cyan>",
+			formatDurationShort(latency.medianSRTT), formatDurationShort(latency.p95SRTT)))
+	}
+
+	if deltaDataRetx > 0 || deltaCtrlRetx > 0 {
+		segments = append(segments, fmt.Sprintf("<blue>Retx</blue>: data <cyan>+%d</cyan>, ctrl <cyan>+%d</cyan>", deltaDataRetx, deltaCtrlRetx))
+	}
+
+	if queueDepth > 0 {
+		segments = append(segments, fmt.Sprintf("<blue>Queues</blue>: <cyan>%d</cyan> across <cyan>%d</cyan> sess", queueDepth, queueSessions))
+	}
+
+	return "\U0001F4CA <green>Server Stats</green> <magenta>|</magenta> " + strings.Join(segments, " <magenta>|</magenta> ")
 }
 
 // formatDurationShort prints a duration in the smallest unit that keeps the
@@ -170,7 +240,7 @@ func formatDurationShort(d time.Duration) string {
 // sessions since the last emit is large enough to warrant an immediate log,
 // regardless of the scheduled interval.
 func (s *Server) activeCountCrossedThresholdLocked(state *statsState, active int) bool {
-	if state.lastEmit.IsZero() {
+	if !state.initialized {
 		return false
 	}
 	prev := state.lastActiveCount
@@ -227,7 +297,6 @@ type latencySample struct {
 	streamSamples   int
 	totalDataRetx   uint64
 	totalCtrlRetx   uint64
-	totalDataPkts   uint64
 	streamsObserved int
 }
 
@@ -271,7 +340,6 @@ func (s *Server) sampleLatencyAndRetx() latencySample {
 			out.totalDataRetx += data
 			out.totalCtrlRetx += ctrl
 		}
-		out.totalDataPkts += record.packetsReceived.Load() + record.packetsSent.Load()
 	}
 
 	out.streamSamples = len(srtts)
@@ -287,24 +355,6 @@ func (s *Server) sampleLatencyAndRetx() latencySample {
 	}
 	out.p95SRTT = srtts[p95Idx]
 	return out
-}
-
-type processStats struct {
-	goroutines int
-	heapInUse  uint64
-	sys        uint64
-	numGC      uint32
-}
-
-func readProcessStats() processStats {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	return processStats{
-		goroutines: runtime.NumGoroutine(),
-		heapInUse:  ms.HeapInuse,
-		sys:        ms.Sys,
-		numGC:      ms.NumGC,
-	}
 }
 
 func bytesPerSecond(deltaBytes uint64, elapsed time.Duration) uint64 {
@@ -339,4 +389,3 @@ func formatThroughput(bytes uint64, duration time.Duration) string {
 	rate := bytesPerSecond(bytes, duration)
 	return formatBytes(rate) + "/s"
 }
-
