@@ -46,6 +46,31 @@ func createTestClient(t *testing.T) *Client {
 	return New(cfg, log, codec)
 }
 
+func TestRuntimePacketDuplicationCountPinsResolverReports(t *testing.T) {
+	c := createTestClient(t)
+	c.cfg.PacketDuplicationCount = 8
+	c.cfg.SetupPacketDuplicationCount = 8
+
+	cases := []struct {
+		name       string
+		packetType uint8
+		want       int
+	}{
+		{"resolver report v1 not multiplied", Enums.PACKET_RESOLVER_REPORT, 1},
+		{"resolver report v2 not multiplied", Enums.PACKET_RESOLVER_REPORT_V2, 1},
+		{"resolver list request not multiplied", Enums.PACKET_RESOLVER_LIST_REQUEST, 1},
+		{"stream data still respects config", Enums.PACKET_STREAM_DATA, 8},
+		{"ping clamped to 2", Enums.PACKET_PING, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := c.runtimePacketDuplicationCount(tc.packetType); got != tc.want {
+				t.Fatalf("packet=%d got=%d want=%d", tc.packetType, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestResetRuntimeBindings(t *testing.T) {
 	c := createTestClient(t)
 	c.last_stream_id = 10

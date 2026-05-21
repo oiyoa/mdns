@@ -281,7 +281,8 @@ func (s *Server) cleanupClosedSession(sessionID uint8, record *sessionRecord) {
 		duration := now.Sub(record.CreatedAt)
 		packets := record.packetsReceived.Load()
 		if duration >= resolverLeaderboardMinSessionDuration && packets >= resolverLeaderboardMinPacketsRX {
-			s.resolverLeaderboard.RecordSession(now, record.resolverList(), duration, record.DownloadMTU)
+			scored := buildSessionResolverScores(record.resolverScoreSnapshot())
+			s.resolverLeaderboard.RecordSession(now, record.resolverList(), duration, record.DownloadMTU, scored)
 		}
 	}
 	s.clearDeferredPacketsForSession(sessionID)

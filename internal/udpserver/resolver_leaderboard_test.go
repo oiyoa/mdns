@@ -32,7 +32,7 @@ const (
 )
 
 func recordOne(lb *resolverLeaderboard, now time.Time, ips []netip.Addr) {
-	lb.RecordSession(now, ips, testDefaultDuration, testDefaultMTU)
+	lb.RecordSession(now, ips, testDefaultDuration, testDefaultMTU, nil)
 }
 
 func TestLeaderboardRecordsAndRanks(t *testing.T) {
@@ -79,7 +79,7 @@ func TestLeaderboardIgnoresInvalidIPsAndNilArgs(t *testing.T) {
 	}
 
 	var nilLB *resolverLeaderboard
-	nilLB.RecordSession(now, []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute, 1200)
+	nilLB.RecordSession(now, []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute, 1200, nil)
 	if nilLB.MaybeEmit(now, nil) {
 		t.Fatal("expected nil receiver MaybeEmit to return false")
 	}
@@ -497,18 +497,186 @@ func TestLeaderboardFlushSnapshotAlwaysWrites(t *testing.T) {
 	}
 }
 
+func TestLeaderboardRecordsScoredEntries(t *testing.T) {
+	lb := newResolverLeaderboard()
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+
+	good := mustAddr(t, "1.1.1.1")
+	bad := mustAddr(t, "8.8.8.8")
+
+	// Both resolvers used in the same number of sessions, same duration/MTU.
+	// good has 99% success; bad has 30% success. Score must put good above bad.
+	for i := 0; i < 5; i++ {
+		lb.RecordSession(now, []netip.Addr{good}, time.Minute*10, 1200, SessionResolverScores{
+			good: {SuccessCount: 99, FailureCount: 1},
+		})
+		lb.RecordSession(now, []netip.Addr{bad}, time.Minute*10, 1200, SessionResolverScores{
+			bad: {SuccessCount: 30, FailureCount: 70},
+		})
+	}
+
+	top := lb.TopForDistribution(5)
+	if len(top) != 2 {
+		t.Fatalf("expected 2 entries, got %d (%v)", len(top), top)
+	}
+	if top[0].AddrPort.Addr() != good {
+		t.Fatalf("higher success rate should rank first, got order: %v", top)
+	}
+}
+
+func TestLeaderboardMixesV1AndV2Sessions(t *testing.T) {
+	// One V1 session for IP A, one V2 session for IP B with 100% success.
+	// The V2 score-rate term should make B rank competitively against A even
+	// though they share the same popularity / duration / MTU. Specifically
+	// B should not be dragged down by "missing" V2 data — A is missing it too
+	// (V1 path), so both go through the redistribute branch.
+	lb := newResolverLeaderboard()
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	a := mustAddr(t, "1.1.1.1")
+	b := mustAddr(t, "8.8.8.8")
+
+	lb.RecordSession(now, []netip.Addr{a}, time.Minute*5, 1200, nil) // V1
+	lb.RecordSession(now, []netip.Addr{b}, time.Minute*5, 1200, SessionResolverScores{
+		b: {SuccessCount: 100, FailureCount: 0},
+	})
+
+	top := lb.TopForDistribution(5)
+	if len(top) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(top))
+	}
+	// B has V2 100% success, A has no V2 data. B should rank at least as high.
+	scoreA, scoreB := uint16(0), uint16(0)
+	for _, e := range top {
+		switch e.AddrPort.Addr() {
+		case a:
+			scoreA = e.Score
+		case b:
+			scoreB = e.Score
+		}
+	}
+	if scoreB < scoreA {
+		t.Fatalf("V2 100%% success should not rank below V1 unknown: scoreA=%d scoreB=%d", scoreA, scoreB)
+	}
+}
+
+func TestLeaderboardSnapshotV1MigrationKeepsHistory(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stats.json")
+
+	// Write a synthetic v1 snapshot (no scored fields).
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	v1 := leaderboardSnapshotFile{
+		Version: 1,
+		Buckets: []leaderboardSnapshotBucket{{
+			Day: now.UTC().Format(resolverLeaderboardDayLayout),
+			Entries: map[string]leaderboardSnapshotMetrics{
+				"1.1.1.1:53": {Sessions: 10, DurationSumNS: uint64(time.Minute * 30), DownloadMTUSum: 12000},
+			},
+		}},
+	}
+	data, err := json.Marshal(v1)
+	if err != nil {
+		t.Fatalf("marshal v1: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+
+	lb := newResolverLeaderboard()
+	lb.ConfigurePersistence(path, nil)
+	lb.LoadSnapshot(now)
+
+	top := lb.TopForDistribution(5)
+	if len(top) != 1 || top[0].AddrPort.Addr() != mustAddr(t, "1.1.1.1") {
+		t.Fatalf("v1 snapshot history must survive migration, got %v", top)
+	}
+	if top[0].Sessions != 10 {
+		t.Fatalf("session count must survive v1->v2 migration, got %d", top[0].Sessions)
+	}
+}
+
+func TestLeaderboardSnapshotRoundTripScoredFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "stats.json")
+
+	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
+	first := newResolverLeaderboard()
+	first.ConfigurePersistence(path, nil)
+	first.RecordSession(now, []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute*5, 1200, SessionResolverScores{
+		mustAddr(t, "1.1.1.1"): {SuccessCount: 42, FailureCount: 3},
+	})
+	first.FlushSnapshot(now)
+
+	// Reload into a fresh leaderboard and confirm scored fields survived.
+	second := newResolverLeaderboard()
+	second.ConfigurePersistence(path, nil)
+	second.LoadSnapshot(now)
+
+	second.mu.Lock()
+	defer second.mu.Unlock()
+	if len(second.buckets) != 1 {
+		t.Fatalf("expected 1 bucket, got %d", len(second.buckets))
+	}
+	entry := second.buckets[0].entries[netip.AddrPortFrom(mustAddr(t, "1.1.1.1"), resolverDefaultPort)]
+	if entry == nil {
+		t.Fatal("entry missing after reload")
+	}
+	if entry.ReportedSuccessSum != 42 || entry.ReportedFailureSum != 3 || entry.SuccessSampleN != 1 {
+		t.Fatalf("scored fields lost on round-trip: %+v", entry)
+	}
+
+	// Confirm the on-disk file uses schema 2.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if !bytes.Contains(raw, []byte(`"version":2`)) {
+		t.Fatalf("snapshot should be schema 2, got: %s", raw)
+	}
+}
+
 func TestComposeRankScoreOrdering(t *testing.T) {
-	// Popularity dominates: A has 10x the sessions of B with identical quality.
-	a := composeRankScore(100, 100, time.Minute, 1200)
-	b := composeRankScore(10, 100, time.Minute, 1200)
+	a := composeRankScore(100, 100, time.Minute, 1200, 0, false, 0, false)
+	b := composeRankScore(10, 100, time.Minute, 1200, 0, false, 0, false)
 	if a <= b {
 		t.Fatalf("more sessions should win: a=%d b=%d", a, b)
 	}
-	// MTU caps cleanly above the limit.
-	c := composeRankScore(50, 100, time.Hour, 9999)
-	d := composeRankScore(50, 100, time.Hour, 4000)
+	c := composeRankScore(50, 100, time.Hour, 9999, 0, false, 0, false)
+	d := composeRankScore(50, 100, time.Hour, 4000, 0, false, 0, false)
 	if c != d {
 		t.Fatalf("MTU above cap should clamp: c=%d d=%d", c, d)
+	}
+}
+
+func TestComposeRankScoreFactorsInSuccessRate(t *testing.T) {
+	bad := composeRankScore(50, 100, time.Minute, 1200, 0.10, true, 0, false)
+	good := composeRankScore(50, 100, time.Minute, 1200, 0.99, true, 0, false)
+	if good <= bad {
+		t.Fatalf("higher success rate should rank higher: good=%d bad=%d", good, bad)
+	}
+}
+
+func TestComposeRankScoreFactorsInRtt(t *testing.T) {
+	slow := composeRankScore(50, 100, time.Minute, 1200, 0.5, true, 250, true)
+	fast := composeRankScore(50, 100, time.Minute, 1200, 0.5, true, 20, true)
+	if fast <= slow {
+		t.Fatalf("lower RTT should rank higher: fast=%d slow=%d", fast, slow)
+	}
+}
+
+func TestComposeRankScoreRedistributesWhenNoSuccessRate(t *testing.T) {
+	noData := composeRankScore(100, 100, time.Minute, 1200, 0, false, 0, false)
+	zeroRate := composeRankScore(100, 100, time.Minute, 1200, 0, true, 0, false)
+	if noData <= zeroRate {
+		t.Fatalf("absent V2 data should out-rank an explicit 0-success-rate report: noData=%d zeroRate=%d", noData, zeroRate)
+	}
+}
+
+func TestComposeRankScoreRedistributesWhenNoRtt(t *testing.T) {
+	noRtt := composeRankScore(100, 100, time.Minute, 1200, 0.5, true, 0, false)
+	worstRtt := composeRankScore(100, 100, time.Minute, 1200, 0.5, true, 0xFFFF, true)
+	if noRtt <= worstRtt {
+		t.Fatalf("absent RTT data should out-rank an explicit max-RTT report: noRtt=%d worstRtt=%d", noRtt, worstRtt)
 	}
 }
 

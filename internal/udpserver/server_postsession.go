@@ -67,6 +67,8 @@ func (s *Server) dispatchPostSessionPacket(vpnPacket VpnProto.Packet, sessionRec
 		return s.handleStreamRSTRequest(vpnPacket)
 	case Enums.PACKET_RESOLVER_REPORT:
 		return s.handleResolverReportRequest(vpnPacket)
+	case Enums.PACKET_RESOLVER_REPORT_V2:
+		return s.handleResolverReportV2Request(vpnPacket)
 	case Enums.PACKET_RESOLVER_LIST_REQUEST:
 		return s.handleResolverListRequest(vpnPacket)
 	default:
@@ -119,10 +121,86 @@ func (s *Server) handleResolverListRequest(vpnPacket VpnProto.Packet) bool {
 	return true
 }
 
+func (s *Server) handleResolverReportV2Request(vpnPacket VpnProto.Packet) bool {
+	record, ok := s.sessions.Get(vpnPacket.SessionID)
+	if !ok || record == nil {
+		return true
+	}
+
+	if !record.acceptResolverReportV2Seq(vpnPacket.SequenceNum) {
+		return true
+	}
+
+	if s.debugLoggingEnabled() {
+		s.log.Debugf(
+			"\U0001F4CA <cyan>Resolver Report V2 Received, Session: <magenta>%d</magenta>, Seq: <magenta>%d</magenta>, PayloadBytes: <magenta>%d</magenta></cyan>",
+			vpnPacket.SessionID, vpnPacket.SequenceNum, len(vpnPacket.Payload),
+		)
+	}
+
+	kind, entries, err := VpnProto.DecodeResolverReportV2(vpnPacket.Payload)
+	if err != nil {
+		if s.debugLoggingEnabled() {
+			s.log.Debugf(
+				"\U0001F4CA <yellow>Resolver Report V2 Parse Failed, Session: <cyan>%d</cyan>, Error: <cyan>%v</cyan></yellow>",
+				vpnPacket.SessionID, err,
+			)
+		}
+		return true
+	}
+
+	ips := make([]netip.Addr, 0, len(entries))
+	scoreMap := make(map[netip.Addr]sessionResolverScore, len(entries))
+	for _, e := range entries {
+		ips = append(ips, e.IP)
+		scoreMap[e.IP] = sessionResolverScore{
+			SuccessCount: e.SuccessCount,
+			FailureCount: e.FailureCount,
+			EWMARttMs:    e.EWMARttMs,
+		}
+	}
+	changed := record.setResolverSet(ips)
+	record.applyResolverScores(scoreMap)
+
+	if changed && s.log != nil {
+		s.log.Infof(
+			"\U0001F4CA <green>Resolver Report V2 Received, Session: <cyan>%d</cyan>, Kind: <cyan>%s</cyan>, Resolvers: <cyan>%s</cyan></green>",
+			vpnPacket.SessionID,
+			resolverReportV2KindName(kind),
+			resolverListDisplay(record.resolverList()),
+		)
+	}
+	return true
+}
+
+func resolverReportV2KindName(k VpnProto.ResolverReportV2Kind) string {
+	switch k {
+	case VpnProto.ResolverReportV2KindFull:
+		return "full"
+	case VpnProto.ResolverReportV2KindIncremental:
+		return "incremental"
+	case VpnProto.ResolverReportV2KindSessionCloseFlush:
+		return "flush"
+	default:
+		return "unknown"
+	}
+}
+
 func (s *Server) handleResolverReportRequest(vpnPacket VpnProto.Packet) bool {
 	record, ok := s.sessions.Get(vpnPacket.SessionID)
 	if !ok || record == nil {
 		return true
+	}
+
+	if !record.acceptResolverReportSeq(vpnPacket.SequenceNum) {
+		return true
+	}
+
+	if s.debugLoggingEnabled() {
+		s.log.Debugf(
+			"\U0001F4CA <cyan>Resolver Report V1 Received, Session: <magenta>%d</magenta>, Seq: <magenta>%d</magenta>, PayloadBytes: <magenta>%d</magenta></cyan>",
+			vpnPacket.SessionID, vpnPacket.SequenceNum, len(vpnPacket.Payload),
+		)
 	}
 
 	entries, err := VpnProto.DecodeResolverReport(vpnPacket.Payload)
@@ -140,9 +218,9 @@ func (s *Server) handleResolverReportRequest(vpnPacket VpnProto.Packet) bool {
 	for _, e := range entries {
 		ips = append(ips, e.IP)
 	}
-	record.setResolverSet(ips)
+	changed := record.setResolverSet(ips)
 
-	if s.log != nil {
+	if changed && s.log != nil {
 		s.log.Infof(
 			"\U0001F4CA <green>Resolver Report Received, Session: <cyan>%d</cyan>, Resolvers: <cyan>%s</cyan></green>",
 			vpnPacket.SessionID,

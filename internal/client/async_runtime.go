@@ -55,6 +55,13 @@ func (c *Client) runtimePacketDuplicationCount(packetType uint8) int {
 		return min(count, 2)
 	}
 
+	// Idempotent control reports — re-emitted on the next trigger.
+	if packetType == Enums.PACKET_RESOLVER_REPORT ||
+		packetType == Enums.PACKET_RESOLVER_REPORT_V2 ||
+		packetType == Enums.PACKET_RESOLVER_LIST_REQUEST {
+		return 1
+	}
+
 	return count
 }
 

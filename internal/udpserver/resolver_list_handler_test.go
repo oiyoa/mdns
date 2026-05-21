@@ -43,9 +43,9 @@ func TestHandleResolverListRequestProducesPayload(t *testing.T) {
 
 	now := time.Date(2026, 5, 16, 12, 0, 0, 0, time.UTC)
 	for i := 0; i < 4; i++ {
-		s.resolverLeaderboard.RecordSession(now, []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute*5, 1200)
+		s.resolverLeaderboard.RecordSession(now, []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute*5, 1200, nil)
 	}
-	s.resolverLeaderboard.RecordSession(now, []netip.Addr{mustAddr(t, "8.8.8.8")}, time.Minute, 900)
+	s.resolverLeaderboard.RecordSession(now, []netip.Addr{mustAddr(t, "8.8.8.8")}, time.Minute, 900, nil)
 
 	ok := s.handleResolverListRequest(VpnProto.Packet{
 		SessionID:  record.ID,
@@ -69,7 +69,7 @@ func TestHandleResolverListRequestRateLimited(t *testing.T) {
 	record := newTestSessionRecord(35)
 	s.sessions.byID[record.ID] = record
 
-	s.resolverLeaderboard.RecordSession(time.Now(), []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute, 1200)
+	s.resolverLeaderboard.RecordSession(time.Now(), []netip.Addr{mustAddr(t, "1.1.1.1")}, time.Minute, 1200, nil)
 
 	for i := 0; i < 3; i++ {
 		if !s.handleResolverListRequest(VpnProto.Packet{

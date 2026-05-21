@@ -51,6 +51,8 @@ type sessionRecord struct {
 	Signature                           [sessionInitDataSize]byte
 	resolverSet                         map[netip.Addr]struct{}
 	resolverSetMu                       sync.Mutex
+	resolverScores                      map[netip.Addr]sessionResolverScore
+	resolverScoresMu                    sync.Mutex
 	packetsReceived                     atomic.Uint64
 	packetsSent                         atomic.Uint64
 	bytesReceived                       atomic.Uint64
@@ -64,6 +66,10 @@ type sessionRecord struct {
 	peakBytesPerSecondTX                uint64
 	streamsCreated                      atomic.Uint64
 	lastListRequestUnixNano             atomic.Int64
+	lastResolverReportSeq               atomic.Uint32
+	lastResolverReportSeqValid          atomic.Bool
+	lastResolverReportV2Seq             atomic.Uint32
+	lastResolverReportV2SeqValid        atomic.Bool
 	MaxPackedBlocks                     int
 	StreamReadBufferSize                int
 	CreatedAt                           time.Time
@@ -733,26 +739,130 @@ func isPubliclyRoutableIP(ip netip.Addr) bool {
 	return true
 }
 
-// setResolverSet replaces the per-session resolver set wholesale with the
-// client's latest report. Entries beyond the cap are silently dropped (the
-// client should never send that many; cap defends against malformed reports).
-// Non-publicly-routable IPs are filtered out — see isPubliclyRoutableIP.
-func (r *sessionRecord) setResolverSet(ips []netip.Addr) {
+// Returns true when the set actually changed — callers gate the INFO log on it.
+func (r *sessionRecord) setResolverSet(ips []netip.Addr) bool {
 	if r == nil {
-		return
+		return false
 	}
 	r.resolverSetMu.Lock()
 	defer r.resolverSetMu.Unlock()
-	r.resolverSet = make(map[netip.Addr]struct{}, len(ips))
+
+	next := make(map[netip.Addr]struct{}, len(ips))
 	for _, ip := range ips {
 		if !isPubliclyRoutableIP(ip) {
 			continue
 		}
-		if len(r.resolverSet) >= resolverSetMaxEntries {
+		if len(next) >= resolverSetMaxEntries {
 			break
 		}
-		r.resolverSet[ip] = struct{}{}
+		next[ip] = struct{}{}
 	}
+
+	changed := !resolverSetEqual(r.resolverSet, next)
+	r.resolverSet = next
+	return changed
+}
+
+type sessionResolverScore struct {
+	SuccessCount uint16
+	FailureCount uint16
+	EWMARttMs    uint16
+}
+
+func (r *sessionRecord) applyResolverScores(entries map[netip.Addr]sessionResolverScore) {
+	if r == nil {
+		return
+	}
+	r.resolverScoresMu.Lock()
+	defer r.resolverScoresMu.Unlock()
+	next := make(map[netip.Addr]sessionResolverScore, len(entries))
+	for ip, s := range entries {
+		if !isPubliclyRoutableIP(ip) {
+			continue
+		}
+		next[ip] = s
+	}
+	r.resolverScores = next
+}
+
+func buildSessionResolverScores(scores map[netip.Addr]sessionResolverScore) SessionResolverScores {
+	if len(scores) == 0 {
+		return nil
+	}
+	out := make(SessionResolverScores, len(scores))
+	for ip, s := range scores {
+		out[ip] = ResolverScoreContribution{
+			SuccessCount: s.SuccessCount,
+			FailureCount: s.FailureCount,
+			EWMARttMs:    s.EWMARttMs,
+		}
+	}
+	return out
+}
+
+func (r *sessionRecord) resolverScoreSnapshot() map[netip.Addr]sessionResolverScore {
+	if r == nil {
+		return nil
+	}
+	r.resolverScoresMu.Lock()
+	defer r.resolverScoresMu.Unlock()
+	if len(r.resolverScores) == 0 {
+		return nil
+	}
+	out := make(map[netip.Addr]sessionResolverScore, len(r.resolverScores))
+	for k, v := range r.resolverScores {
+		out[k] = v
+	}
+	return out
+}
+
+// First-seen returns true; later identical seq drops fanout/retransmit copies.
+func (r *sessionRecord) acceptResolverReportSeq(seq uint16) bool {
+	if r == nil {
+		return false
+	}
+	wide := uint32(seq)
+	if !r.lastResolverReportSeqValid.Load() {
+		r.lastResolverReportSeq.Store(wide)
+		r.lastResolverReportSeqValid.Store(true)
+		return true
+	}
+	prev := r.lastResolverReportSeq.Load()
+	if uint16(prev) == seq {
+		return false
+	}
+	r.lastResolverReportSeq.Store(wide)
+	return true
+}
+
+func (r *sessionRecord) acceptResolverReportV2Seq(seq uint16) bool {
+	if r == nil {
+		return false
+	}
+	wide := uint32(seq)
+	if !r.lastResolverReportV2SeqValid.Load() {
+		r.lastResolverReportV2Seq.Store(wide)
+		r.lastResolverReportV2SeqValid.Store(true)
+		return true
+	}
+	prev := r.lastResolverReportV2Seq.Load()
+	if uint16(prev) == seq {
+		return false
+	}
+	r.lastResolverReportV2Seq.Store(wide)
+	return true
+}
+
+func resolverSetEqual(a, b map[netip.Addr]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for ip := range a {
+		if _, ok := b[ip]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *sessionRecord) resolverList() []netip.Addr {

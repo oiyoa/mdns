@@ -70,7 +70,8 @@ func DefaultPacketPriority(packetType uint8) int {
 
 	case PACKET_STREAM_CLOSE_WRITE,
 		PACKET_SESSION_CLOSE,
-		PACKET_RESOLVER_REPORT:
+		PACKET_RESOLVER_REPORT,
+		PACKET_RESOLVER_REPORT_V2:
 		return PacketPriorityLow
 
 	case PACKET_PING,

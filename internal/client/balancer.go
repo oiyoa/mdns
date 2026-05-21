@@ -12,6 +12,7 @@ package client
 import (
 	"encoding/binary"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1254,6 +1255,79 @@ func (b *Balancer) removeActiveIndexLocked(idx int) {
 			break
 		}
 	}
+}
+
+type ResolverScoreSnapshot struct {
+	IP           netip.Addr
+	SuccessCount uint64
+	FailureCount uint64
+	EWMARttMs    uint16
+	HasRtt       bool
+}
+
+// One entry per unique IP across active (domain × ip) rows — server doesn't want N copies.
+func (b *Balancer) SnapshotResolverScores() []ResolverScoreSnapshot {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if len(b.activeIDs) == 0 {
+		return nil
+	}
+
+	type acc struct {
+		successCount uint64
+		failureCount uint64
+		rttMicrosSum uint64
+		rttCount     uint64
+	}
+	byIP := make(map[netip.Addr]*acc, len(b.activeIDs))
+
+	for _, idx := range b.activeIDs {
+		if idx < 0 || idx >= len(b.connections) {
+			continue
+		}
+		conn := &b.connections[idx]
+		ip, err := netip.ParseAddr(conn.Resolver)
+		if err != nil || !ip.IsValid() {
+			continue
+		}
+		ip = ip.Unmap()
+		var acked, lost, rttMicrosSum, rttCount uint64
+		if idx < len(b.stats) {
+			_, acked, lost, rttMicrosSum, rttCount = b.stats[idx].snapshot()
+		}
+		entry, ok := byIP[ip]
+		if !ok {
+			entry = &acc{}
+			byIP[ip] = entry
+		}
+		entry.successCount += acked
+		entry.failureCount += lost
+		entry.rttMicrosSum += rttMicrosSum
+		entry.rttCount += rttCount
+	}
+
+	out := make([]ResolverScoreSnapshot, 0, len(byIP))
+	for ip, entry := range byIP {
+		snap := ResolverScoreSnapshot{
+			IP:           ip,
+			SuccessCount: entry.successCount,
+			FailureCount: entry.failureCount,
+		}
+		if entry.rttCount > 0 {
+			millis := entry.rttMicrosSum / entry.rttCount / 1000
+			if millis > 0xFFFF {
+				millis = 0xFFFF
+			}
+			snap.EWMARttMs = uint16(millis)
+			snap.HasRtt = true
+		}
+		out = append(out, snap)
+	}
+	return out
 }
 
 // SetActiveSetChangedHandler registers a callback fired whenever the set of

@@ -28,7 +28,7 @@ const (
 	resolverLeaderboardBucketCap    = 10000
 	resolverLeaderboardTopN         = 10
 	resolverLeaderboardSaveInterval = 10 * time.Minute
-	resolverLeaderboardSchema       = 1
+	resolverLeaderboardSchema       = 2
 	resolverLeaderboardDayLayout    = "2006-01-02"
 
 	resolverLeaderboardMinSessionDuration = 30 * time.Second
@@ -36,17 +36,33 @@ const (
 
 	resolverDefaultPort = 53
 
-	resolverScoreDurationCap = 30 * time.Minute
-	resolverScoreMTUCap      = 2000.0
-	resolverScoreWeightPop   = 0.5
-	resolverScoreWeightDur   = 0.25
-	resolverScoreWeightMTU   = 0.25
+	resolverScoreDurationCap       = 30 * time.Minute
+	resolverScoreMTUCap            = 2000.0
+	resolverScoreRttCapMs          = 300.0
+	resolverScoreWeightPop         = 0.40
+	resolverScoreWeightDur         = 0.15
+	resolverScoreWeightMTU         = 0.15
+	resolverScoreWeightSuccessRate = 0.20
+	resolverScoreWeightRtt         = 0.10
 )
 
 type resolverDailyEntry struct {
-	Sessions       uint64
-	DurationSumNS  uint64
-	DownloadMTUSum uint64
+	Sessions           uint64
+	DurationSumNS      uint64
+	DownloadMTUSum     uint64
+	ReportedSuccessSum uint64
+	ReportedFailureSum uint64
+	SuccessSampleN     uint64
+	ReportedRttMsSum   uint64
+	RttSampleN         uint64
+}
+
+type SessionResolverScores map[netip.Addr]ResolverScoreContribution
+
+type ResolverScoreContribution struct {
+	SuccessCount uint16
+	FailureCount uint16
+	EWMARttMs    uint16
 }
 
 type resolverDailyBucket struct {
@@ -87,9 +103,8 @@ func buildResolverLeaderboard(cfg config.ServerConfig, log *logger.Logger) *reso
 	return lb
 }
 
-// RecordSession folds one closed session's contribution into the current
-// daily bucket. The caller is responsible for the real-session threshold.
-func (l *resolverLeaderboard) RecordSession(now time.Time, resolvers []netip.Addr, duration time.Duration, downloadMTU uint16) {
+// scoredEntries nil = V1 session (no success-rate contribution). Caller enforces the real-session threshold.
+func (l *resolverLeaderboard) RecordSession(now time.Time, resolvers []netip.Addr, duration time.Duration, downloadMTU uint16, scoredEntries SessionResolverScores) {
 	if l == nil || len(resolvers) == 0 {
 		return
 	}
@@ -120,6 +135,18 @@ func (l *resolverLeaderboard) RecordSession(now time.Time, resolvers []netip.Add
 		entry.Sessions++
 		entry.DurationSumNS += durationNS
 		entry.DownloadMTUSum += mtu
+		if scoredEntries != nil {
+			if score, ok := scoredEntries[ip.Unmap()]; ok {
+				entry.ReportedSuccessSum += uint64(score.SuccessCount)
+				entry.ReportedFailureSum += uint64(score.FailureCount)
+				entry.SuccessSampleN++
+				// 0 = client sentinel for "no RTT samples" — skip rather than treat as 0ms.
+				if score.EWMARttMs > 0 {
+					entry.ReportedRttMsSum += uint64(score.EWMARttMs)
+					entry.RttSampleN++
+				}
+			}
+		}
 		l.dirtySinceSave = true
 	}
 }
@@ -216,6 +243,11 @@ func (l *resolverLeaderboard) snapshotTopLocked(n int) ([]resolverLeaderboardEnt
 		sessions       uint64
 		durationSumNS  uint64
 		downloadMTUSum uint64
+		reportedSucc   uint64
+		reportedFail   uint64
+		successSampleN uint64
+		reportedRttSum uint64
+		rttSampleN     uint64
 	}
 	totals := make(map[netip.AddrPort]*agg, 128)
 	for _, bucket := range l.buckets {
@@ -228,6 +260,11 @@ func (l *resolverLeaderboard) snapshotTopLocked(n int) ([]resolverLeaderboardEnt
 			a.sessions += e.Sessions
 			a.durationSumNS += e.DurationSumNS
 			a.downloadMTUSum += e.DownloadMTUSum
+			a.reportedSucc += e.ReportedSuccessSum
+			a.reportedFail += e.ReportedFailureSum
+			a.successSampleN += e.SuccessSampleN
+			a.reportedRttSum += e.ReportedRttMsSum
+			a.rttSampleN += e.RttSampleN
 		}
 	}
 	if len(totals) == 0 {
@@ -249,12 +286,28 @@ func (l *resolverLeaderboard) snapshotTopLocked(n int) ([]resolverLeaderboardEnt
 			avgDuration = time.Duration(a.durationSumNS / a.sessions)
 			avgMTU = uint16(a.downloadMTUSum / a.sessions)
 		}
+		var successRate float64
+		var hasRate bool
+		if a.successSampleN > 0 && (a.reportedSucc+a.reportedFail) > 0 {
+			successRate = float64(a.reportedSucc) / float64(a.reportedSucc+a.reportedFail)
+			hasRate = true
+		}
+		var avgRttMs uint16
+		var hasRtt bool
+		if a.rttSampleN > 0 {
+			avg := a.reportedRttSum / a.rttSampleN
+			if avg > 0xFFFF {
+				avg = 0xFFFF
+			}
+			avgRttMs = uint16(avg)
+			hasRtt = true
+		}
 		entries = append(entries, resolverLeaderboardEntry{
 			AddrPort:       k,
 			Sessions:       a.sessions,
 			AvgDuration:    avgDuration,
 			AvgDownloadMTU: avgMTU,
-			Score:          composeRankScore(a.sessions, maxSessions, avgDuration, avgMTU),
+			Score:          composeRankScore(a.sessions, maxSessions, avgDuration, avgMTU, successRate, hasRate, avgRttMs, hasRtt),
 		})
 	}
 	slices.SortFunc(entries, func(a, b resolverLeaderboardEntry) int {
@@ -278,10 +331,9 @@ func (l *resolverLeaderboard) snapshotTopLocked(n int) ([]resolverLeaderboardEnt
 	return entries, len(totals)
 }
 
-// composeRankScore maps (popularity, avg duration, avg MTU) into a [0..65535]
-// rank. Caller-opaque; clients sort descending. Tweaking weights or caps
-// changes the leaderboard without touching the wire format.
-func composeRankScore(sessions, maxSessions uint64, avgDuration time.Duration, avgMTU uint16) uint16 {
+// Missing client-reported terms have their weight redistributed to the others
+// so V1-only sessions still score on the original popularity/duration/MTU split.
+func composeRankScore(sessions, maxSessions uint64, avgDuration time.Duration, avgMTU uint16, successRate float64, hasSuccessRate bool, avgRttMs uint16, hasRtt bool) uint16 {
 	popularity := 0.0
 	if maxSessions > 0 {
 		popularity = float64(sessions) / float64(maxSessions)
@@ -294,9 +346,51 @@ func composeRankScore(sessions, maxSessions uint64, avgDuration time.Duration, a
 	if mtuNorm > 1 {
 		mtuNorm = 1
 	}
-	score := resolverScoreWeightPop*popularity +
-		resolverScoreWeightDur*durationNorm +
-		resolverScoreWeightMTU*mtuNorm
+	rttNorm := 0.0
+	if hasRtt && resolverScoreRttCapMs > 0 {
+		rttNorm = 1.0 - float64(avgRttMs)/resolverScoreRttCapMs
+		if rttNorm < 0 {
+			rttNorm = 0
+		}
+	}
+	if successRate > 1 {
+		successRate = 1
+	}
+
+	weightPop := resolverScoreWeightPop
+	weightDur := resolverScoreWeightDur
+	weightMTU := resolverScoreWeightMTU
+	weightSR := resolverScoreWeightSuccessRate
+	weightRtt := resolverScoreWeightRtt
+	switch {
+	case !hasSuccessRate && !hasRtt:
+		share := (weightSR + weightRtt) / 3.0
+		weightPop += share
+		weightDur += share
+		weightMTU += share
+		weightSR = 0
+		weightRtt = 0
+	case !hasSuccessRate:
+		share := weightSR / 4.0
+		weightPop += share
+		weightDur += share
+		weightMTU += share
+		weightRtt += share
+		weightSR = 0
+	case !hasRtt:
+		share := weightRtt / 4.0
+		weightPop += share
+		weightDur += share
+		weightMTU += share
+		weightSR += share
+		weightRtt = 0
+	}
+
+	score := weightPop*popularity +
+		weightDur*durationNorm +
+		weightMTU*mtuNorm +
+		weightSR*successRate +
+		weightRtt*rttNorm
 	if score < 0 {
 		score = 0
 	}
@@ -322,9 +416,14 @@ type leaderboardSnapshotBucket struct {
 }
 
 type leaderboardSnapshotMetrics struct {
-	Sessions       uint64 `json:"sessions"`
-	DurationSumNS  uint64 `json:"duration_ns"`
-	DownloadMTUSum uint64 `json:"mtu_sum"`
+	Sessions           uint64 `json:"sessions"`
+	DurationSumNS      uint64 `json:"duration_ns"`
+	DownloadMTUSum     uint64 `json:"mtu_sum"`
+	ReportedSuccessSum uint64 `json:"reported_success,omitempty"`
+	ReportedFailureSum uint64 `json:"reported_failure,omitempty"`
+	SuccessSampleN     uint64 `json:"success_sample_n,omitempty"`
+	ReportedRttMsSum   uint64 `json:"reported_rtt_ms,omitempty"`
+	RttSampleN         uint64 `json:"rtt_sample_n,omitempty"`
 }
 
 func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
@@ -363,7 +462,8 @@ func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
 		}
 		return
 	}
-	if snap.Version != resolverLeaderboardSchema {
+	// v1 reads cleanly into v2 — missing scored fields zero out, redistribute branch handles them.
+	if snap.Version != resolverLeaderboardSchema && snap.Version != 1 {
 		if log != nil {
 			log.Warnf(
 				"\U0001F4CA <yellow>Resolver Stats Snapshot Version Mismatch, Got: <cyan>%d</cyan>, Want: <cyan>%d</cyan> — starting fresh</yellow>",
@@ -396,9 +496,14 @@ func (l *resolverLeaderboard) LoadSnapshot(now time.Time) {
 				break
 			}
 			entries[ap] = &resolverDailyEntry{
-				Sessions:       m.Sessions,
-				DurationSumNS:  m.DurationSumNS,
-				DownloadMTUSum: m.DownloadMTUSum,
+				Sessions:           m.Sessions,
+				DurationSumNS:      m.DurationSumNS,
+				DownloadMTUSum:     m.DownloadMTUSum,
+				ReportedSuccessSum: m.ReportedSuccessSum,
+				ReportedFailureSum: m.ReportedFailureSum,
+				SuccessSampleN:     m.SuccessSampleN,
+				ReportedRttMsSum:   m.ReportedRttMsSum,
+				RttSampleN:         m.RttSampleN,
 			}
 		}
 		if len(entries) == 0 {
@@ -515,9 +620,14 @@ func (l *resolverLeaderboard) serializeLocked() ([]byte, error) {
 		}
 		for ap, e := range b.entries {
 			entry.Entries[ap.String()] = leaderboardSnapshotMetrics{
-				Sessions:       e.Sessions,
-				DurationSumNS:  e.DurationSumNS,
-				DownloadMTUSum: e.DownloadMTUSum,
+				Sessions:           e.Sessions,
+				DurationSumNS:      e.DurationSumNS,
+				DownloadMTUSum:     e.DownloadMTUSum,
+				ReportedSuccessSum: e.ReportedSuccessSum,
+				ReportedFailureSum: e.ReportedFailureSum,
+				SuccessSampleN:     e.SuccessSampleN,
+				ReportedRttMsSum:   e.ReportedRttMsSum,
+				RttSampleN:         e.RttSampleN,
 			}
 		}
 		snap.Buckets = append(snap.Buckets, entry)
