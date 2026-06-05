@@ -331,6 +331,14 @@ func LoadClientConfigFromJSONBase64WithOverrides(encoded string, overrides Clien
 }
 
 func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
+	return finalizeClientConfigOpts(cfg, true)
+}
+
+// finalizeClientConfigOpts applies the same defaults/clamps/validation as
+// finalizeClientConfig. loadResolvers=false skips the resolver-file load for the
+// standalone MTU probe, which is handed the resolver IP directly and never uses
+// the balancer/resolver list.
+func finalizeClientConfigOpts(cfg ClientConfig, loadResolvers bool) (ClientConfig, error) {
 	cfg.ProtocolType = strings.ToUpper(strings.TrimSpace(cfg.ProtocolType))
 	cfg.LogLevel = strings.TrimSpace(cfg.LogLevel)
 	if cfg.LogLevel == "" {
@@ -480,6 +488,13 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 	}
 
 	cfg.ResolversFilePath = strings.TrimSpace(cfg.ResolversFilePath)
+
+	if !loadResolvers {
+		cfg.ResolversFilePath = ""
+		cfg.Resolvers = nil
+		cfg.ResolverMap = nil
+		return cfg, nil
+	}
 
 	resolvers, resolverMap, err := LoadClientResolvers(cfg.ResolversPath())
 	if err != nil {

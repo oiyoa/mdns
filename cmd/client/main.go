@@ -191,6 +191,11 @@ func parseClientCLIArgs(args []string, output io.Writer) (*clientCLIOptions, con
 }
 
 func main() {
+	// `client probe ...` certifies one resolver and exits (see probe.go).
+	if len(os.Args) > 1 && os.Args[1] == "probe" {
+		os.Exit(runProbeCommand(os.Args[2:]))
+	}
+
 	opts, overrides, err := parseClientCLIArgs(os.Args[1:], os.Stdout)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n\n", err)
